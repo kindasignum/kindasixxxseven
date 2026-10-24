@@ -10,13 +10,13 @@ VK-бот учёта тренировок.
 Запуск:            python bot.py
 Список реакций VK: python bot.py --assets
 """
-<<<<<<< HEAD
-=======
+
+
 import os
 print("B64_EXISTS:", bool(os.getenv("GOOGLE_CREDENTIALS_BASE64")))
 print("B64_LEN:", len(os.getenv("GOOGLE_CREDENTIALS_BASE64", "")))
 
->>>>>>> c46da25c8ce711c7fdbe19aa5fc9b80d1953bbfb
+
 import json
 import logging
 import os
@@ -42,15 +42,15 @@ except ImportError:
 # ───────────────────────── настройки ─────────────────────────
 TOKEN = os.getenv("VK_TOKEN", "")
 GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))
-<<<<<<< HEAD
+
 # База хранится в DATA_DIR (на хостинге — постоянный диск, например /app/data) или в DB_PATH
 DATA_DIR = os.getenv("DATA_DIR", "").strip()
 DB_PATH = os.getenv("DB_PATH") or (os.path.join(DATA_DIR, "trainings.db") if DATA_DIR else "trainings.db")
 if DB_PATH != ":memory:" and os.path.dirname(DB_PATH):
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-=======
+
 DB_PATH = os.getenv("DB_PATH", "trainings.db")
->>>>>>> c46da25c8ce711c7fdbe19aa5fc9b80d1953bbfb
+
 MSK = ZoneInfo("Europe/Moscow")
 EDIT_LIMIT_SEC = 24 * 3600  # VK разрешает редактировать сообщения сутки
 JOIN_TOLERANCE_SEC = 6 * 3600  # насколько раньше старта допускается время прихода при правках
@@ -996,13 +996,13 @@ def main():
         print(json.dumps(vk_session.method("messages.getReactionsAssets"), ensure_ascii=False, indent=2))
         return
 
-<<<<<<< HEAD
+
     log.info("База данных: %s", os.path.abspath(DB_PATH) if DB_PATH != ":memory:" else DB_PATH)
     if os.path.isdir("/app/data") and not os.path.abspath(DB_PATH).startswith("/app/data"):
         log.warning("Каталог /app/data существует, но база лежит вне его — при обновлении/перезапуске "
                     "хостинга она может стереться. Задайте переменную DATA_DIR=/app/data")
-=======
->>>>>>> c46da25c8ce711c7fdbe19aa5fc9b80d1953bbfb
+
+
     for k, v in REACTIONS.items():
         if v is None:
             log.warning("REACTION '%s' не настроена — реакция ставиться не будет", k)
