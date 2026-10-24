@@ -38,10 +38,7 @@
       ],
     }
 """
-<<<<<<< HEAD
 import base64
-=======
->>>>>>> c46da25c8ce711c7fdbe19aa5fc9b80d1953bbfb
 import json
 import logging
 import os
@@ -58,10 +55,6 @@ except ImportError:
     pass
 
 log = logging.getLogger("trainbot.sheets")
-<<<<<<< HEAD
-=======
-
->>>>>>> c46da25c8ce711c7fdbe19aa5fc9b80d1953bbfb
 MSK = ZoneInfo("Europe/Moscow")
 
 TRAININGS_HEADERS = [
@@ -94,7 +87,6 @@ def _cfg():
     )
 
 
-<<<<<<< HEAD
 def _credentials_info():
     """
     Ключ сервисного аккаунта из переменной окружения GOOGLE_CREDENTIALS_JSON (для хостинга,
@@ -122,8 +114,6 @@ def _credentials_info():
     return info
 
 
-=======
->>>>>>> c46da25c8ce711c7fdbe19aa5fc9b80d1953bbfb
 _sh_cache = {}
 
 
@@ -133,28 +123,18 @@ def _spreadsheet(sheet_id: str = ""):
     if sheet_id in _sh_cache:
         return _sh_cache[sheet_id]
     if not sheet_id:
-<<<<<<< HEAD
         raise SheetsError("Не задан GOOGLE_SHEET_ID (.env или переменные окружения хостинга)")
     info = _credentials_info()
     if info is None and not os.path.exists(creds):
         raise SheetsError("Не найден ключ Google: задайте переменную GOOGLE_CREDENTIALS_JSON "
                           f"(хостинг) или положите файл {creds} (локально, GOOGLE_CREDENTIALS_FILE)")
-=======
-        raise SheetsError("Не задан GOOGLE_SHEET_ID в .env")
-    if not os.path.exists(creds):
-        raise SheetsError(f"Не найден файл ключа Google: {creds} (GOOGLE_CREDENTIALS_FILE)")
->>>>>>> c46da25c8ce711c7fdbe19aa5fc9b80d1953bbfb
     try:
         import gspread
     except ImportError:
         raise SheetsError("Не установлен gspread: pip install -r requirements.txt")
     try:
-<<<<<<< HEAD
         client = gspread.service_account_from_dict(info) if info else gspread.service_account(filename=creds)
         _sh_cache[sheet_id] = client.open_by_key(sheet_id)
-=======
-        _sh_cache[sheet_id] = gspread.service_account(filename=creds).open_by_key(sheet_id)
->>>>>>> c46da25c8ce711c7fdbe19aa5fc9b80d1953bbfb
     except Exception as e:  # noqa: BLE001
         raise SheetsError(
             f"Не удалось открыть таблицу ({type(e).__name__}: {e}). Проверьте ID таблицы, "
@@ -543,12 +523,8 @@ def check_connection() -> dict:
     _ensure_ws(ws_tr, TRAININGS_HEADERS)
     _ensure_ws(ws_p, PARTS_HEADERS)
     try:
-<<<<<<< HEAD
         info = _credentials_info()
         email = info["client_email"] if info else json.load(open(creds, encoding="utf-8")).get("client_email")
-=======
-        email = json.load(open(creds, encoding="utf-8")).get("client_email")
->>>>>>> c46da25c8ce711c7fdbe19aa5fc9b80d1953bbfb
     except Exception:  # noqa: BLE001
         email = None
     try:
