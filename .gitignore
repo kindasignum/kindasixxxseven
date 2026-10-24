@@ -1,0 +1,12 @@
+# секреты и данные — в GitHub не попадают
+.env
+*.json
+credentials_b64.txt
+*.db
+*.db-journal
+*.log
+
+# служебное
+.venv/
+__pycache__/
+*.pyc

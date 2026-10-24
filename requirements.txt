@@ -1,0 +1,4 @@
+vk_api>=11.9.9
+python-dotenv>=1.0
+tzdata
+gspread>=6.0
