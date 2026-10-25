@@ -10,13 +10,6 @@ VK-бот учёта тренировок.
 Запуск:            python bot.py
 Список реакций VK: python bot.py --assets
 """
-
-
-import os
-print("B64_EXISTS:", bool(os.getenv("GOOGLE_CREDENTIALS_BASE64")))
-print("B64_LEN:", len(os.getenv("GOOGLE_CREDENTIALS_BASE64", "")))
-
-
 import json
 import logging
 import os
@@ -42,15 +35,11 @@ except ImportError:
 # ───────────────────────── настройки ─────────────────────────
 TOKEN = os.getenv("VK_TOKEN", "")
 GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))
-
 # База хранится в DATA_DIR (на хостинге — постоянный диск, например /app/data) или в DB_PATH
 DATA_DIR = os.getenv("DATA_DIR", "").strip()
 DB_PATH = os.getenv("DB_PATH") or (os.path.join(DATA_DIR, "trainings.db") if DATA_DIR else "trainings.db")
 if DB_PATH != ":memory:" and os.path.dirname(DB_PATH):
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-
-DB_PATH = os.getenv("DB_PATH", "trainings.db")
-
 MSK = ZoneInfo("Europe/Moscow")
 EDIT_LIMIT_SEC = 24 * 3600  # VK разрешает редактировать сообщения сутки
 JOIN_TOLERANCE_SEC = 6 * 3600  # насколько раньше старта допускается время прихода при правках
@@ -168,8 +157,8 @@ def norm_name(raw: str) -> str:
 
 
 def calc_points(minutes: int) -> float:
-    """30 мин = 0,5 балла, допуск ±15 мин (25→0,5; 45→1; 75→1,5)."""
-    return ((minutes + 15) // 30) * 0.5
+    """0,5 балла за каждые полные 25 минут: 24 мин и меньше — 0; 25→0,5; 50→1; 75→1,5."""
+    return (minutes // 25) * 0.5
 
 
 def fmt_points(p: float) -> str:
@@ -196,6 +185,18 @@ def fmt_t(ts: int, start_ts: int) -> str:
     if d.date() != dt(start_ts).date():
         s += f" ({d:%d.%m})"
     return s
+
+
+def training_label(t):
+    """(дата, время): «24.10.2026», «15:00-16:30»; через полночь дата — «24.10.2026–25.10.2026»."""
+    s, e = dt(t["start_ts"]), dt(t["end_ts"])
+    date = f"{s:%d.%m.%Y}" if s.date() == e.date() else f"{s:%d.%m.%Y}–{e:%d.%m.%Y}"
+    return date, f"{s:%H:%M}-{e:%H:%M}"
+
+
+def name_key(s: str) -> str:
+    """Имя для сравнения: без регистра, ё=е, лишние пробелы убраны."""
+    return " ".join(str(s).casefold().replace("ё", "е").split())
 
 
 _names = {}
@@ -228,6 +229,23 @@ def trainer_info(members, leader_id: int):
     if rec:
         return rec["name"] or user_name(leader_id), rec["cw_id"], True
     return user_name(leader_id), "", False
+
+
+def autocorrect_participants(tid: int):
+    """
+    Автокоррекция имён по листу «Участники»: точное совпадение → без знаков → по первым двум словам.
+    Найденное имя заменяется на написание из таблицы. Не нашлось — имя остаётся как есть
+    (в отчёте помечено ⚠, исправить должен человек: «N имя Верное Имя»).
+    """
+    members = get_members()
+    if not members:
+        return
+    for p in db.execute("SELECT * FROM participants WHERE training_id=?", (tid,)).fetchall():
+        rec = members.participant(p["name"], p["vk_id"])
+        if rec and rec["name"] and rec["name"] != p["name"]:
+            log.info("Автокоррекция имени: «%s» → «%s»", p["name"], rec["name"])
+            db.execute("UPDATE participants SET name=? WHERE id=?", (rec["name"], p["id"]))
+    db.commit()
 
 
 def user_link(uid: int) -> str:
@@ -466,12 +484,11 @@ def render_report(tid: int) -> str:
             f"{fmt_dur(m)}, {fmt_points(calc_points(m))} б."
         )
 
-    if s.date() == e.date():
-        head = f"Тренировка {s:%d.%m.%Y}. {s:%H:%M}-{e:%H:%M}"
-    else:  # тренировка перешла через полночь
-        head = f"Тренировка {s:%d.%m.%Y}–{e:%d.%m.%Y}. {s:%H:%M}-{e:%H:%M}"
-    own = [line(p) for p in parts if not p["auto_leave"]]
-    auto = [line(p) for p in parts if p["auto_leave"]]
+    d_part, t_part = training_label(t)
+    head = f"Тренировка {d_part}. {t_part}"
+    # «Участники» — кто не уходил раньше конца тренировки; «Ушли досрочно» — остальные
+    stayed = [line(p) for p in parts if p["leave_ts"] >= t["end_ts"]]
+    early = [line(p) for p in parts if p["leave_ts"] < t["end_ts"]]
 
     out = [
         head,
@@ -480,10 +497,10 @@ def render_report(tid: int) -> str:
         f"Вёл тренировку: [id{t['leader_id']}|{lead_name}]",
         "",
         "Участники:",
-        *(own or ["—"]),
+        *(stayed or ["—"]),
     ]
-    if auto:
-        out += ["", "Не зафиксирован самостоятельный уход:", *auto]
+    if early:
+        out += ["", "Ушли досрочно:", *early]
     notes = []
     if unmatched:
         notes.append("⚠ — персонаж не найден на листе «Участники», CW ID не будет записан. "
@@ -575,6 +592,59 @@ def next_num(tid: int) -> int:
     return r.fetchone()["n"]
 
 
+def process_join(peer: int, tr, uid: int, cmid, name: str, ts: int):
+    """
+    Регистрация участника по #лапа. Используется и для новых, и для отредактированных сообщений.
+    Если это сообщение уже добавило участника (повторное событие или правка имени), дубль не создаётся:
+    имя обновляется, пока участник не ушёл.
+    """
+    existing = db.execute(
+        "SELECT * FROM participants WHERE training_id=? AND join_cmid=? AND vk_id=?",
+        (tr["id"], cmid, uid),
+    ).fetchone() if cmid else None
+    if existing:
+        if existing["leave_ts"] is None and existing["name"] != name:
+            db.execute("UPDATE participants SET name=? WHERE id=?", (name, existing["id"]))
+            db.commit()
+        return
+    dup = db.execute(
+        "SELECT 1 FROM participants WHERE training_id=? AND vk_id=? AND name=? AND leave_ts IS NULL",
+        (tr["id"], uid, name),
+    ).fetchone()
+    if dup:
+        return
+    db.execute(
+        "INSERT INTO participants(training_id,num,vk_id,name,join_ts,join_cmid) VALUES(?,?,?,?,?,?)",
+        (tr["id"], next_num(tr["id"]), uid, name, max(ts, tr["start_ts"]), cmid),  # раньше старта — время старта
+    )
+    db.commit()
+    react(peer, cmid, "eye")
+
+
+def handle_chat_edit(msg: dict):
+    """
+    Отредактированное сообщение в беседе: если после правки это корректное «#лапа Имя» и тренировка
+    сейчас идёт (начата и не закончена) — участник добавляется. Время прихода — время исходного
+    сообщения (но не раньше старта тренировки).
+    """
+    peer, uid, cmid = msg["peer_id"], msg.get("from_id", 0), msg.get("conversation_message_id")
+    if msg.get("action") or uid <= 0 or not cmid:
+        return
+    m = RE_JOIN.match(MENTION_RE.sub("", msg.get("text") or "").strip())
+    if not m:
+        return
+    register_chat(peer)
+    chat = get_chat(peer)
+    if not chat or not chat["enabled"]:
+        return
+    tr = active_training(peer)
+    if not tr:
+        return  # тренировка не начата или уже закончена
+    name = norm_name(m.group(1))
+    if name:
+        process_join(peer, tr, uid, cmid, name, floor_min(msg.get("date") or int(time.time())))
+
+
 def handle_chat(msg: dict):
     peer, uid, cmid = msg["peer_id"], msg["from_id"], msg.get("conversation_message_id")
     if msg.get("action"):
@@ -619,18 +689,7 @@ def handle_chat(msg: dict):
         name = norm_name(m.group(1))
         if not name:
             return
-        dup = db.execute(
-            "SELECT 1 FROM participants WHERE training_id=? AND vk_id=? AND name=? AND leave_ts IS NULL",
-            (tr["id"], uid, name),
-        ).fetchone()
-        if dup:
-            return
-        db.execute(
-            "INSERT INTO participants(training_id,num,vk_id,name,join_ts,join_cmid) VALUES(?,?,?,?,?,?)",
-            (tr["id"], next_num(tr["id"]), uid, name, max(ts, tr["start_ts"]), cmid),  # раньше старта — время старта
-        )
-        db.commit()
-        react(peer, cmid, "eye")
+        process_join(peer, tr, uid, cmid, name, ts)
         return
 
     # #уход Имя
@@ -679,6 +738,7 @@ def handle_chat(msg: dict):
         )
         db.commit()
         chat_title(peer, refresh=True)  # актуальное название на момент отчёта
+        autocorrect_participants(tr["id"])
         send_new_report(tr["id"], [tr["leader_id"], uid])
         return
 
@@ -768,12 +828,16 @@ def apply_edits(tid: int, lines):
                     cur = db.execute(
                         "DELETE FROM participants WHERE training_id=? AND num=?", (tid, int(arg))
                     )
+                    removed = cur.rowcount
                 else:
-                    cur = db.execute(
-                        "DELETE FROM participants WHERE training_id=? AND name=?",
-                        (tid, norm_name(arg)),
-                    )
-                if cur.rowcount == 0:
+                    key = name_key(arg)
+                    ids = [r["id"] for r in db.execute(
+                        "SELECT id,name FROM participants WHERE training_id=?", (tid,)
+                    ) if name_key(r["name"]) == key]
+                    for i in ids:
+                        db.execute("DELETE FROM participants WHERE id=?", (i,))
+                    removed = len(ids)
+                if removed == 0:
                     raise EditError(f"не найден: {arg}")
 
 
@@ -947,6 +1011,7 @@ def handle_private(msg: dict):
         log.info("Правка отклонена: %s", e)
         react(uid, cmid, "question")
         return
+    autocorrect_participants(rep["training_id"])
     update_report(rep)
     react(uid, cmid, "check")
 
@@ -962,6 +1027,28 @@ def answer_event(event_obj: dict, text: str):
         )
     except ApiError as e:
         log.warning("sendMessageEventAnswer: %s", e)
+
+
+def remove_report_keyboard(uid: int, cmid, tid: int) -> bool:
+    """Убирает кнопку «Подтвердить» из сообщения с отчётом (текст отчёта не меняется)."""
+    if not cmid:
+        row = db.execute("SELECT cmid FROM reports WHERE training_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
+                         (tid, uid)).fetchone()
+        cmid = row["cmid"] if row else None
+    if not cmid:
+        return False
+    text = render_report(tid)
+    # сначала явно пустая inline-клавиатура, затем — правка без клавиатуры
+    for kb in (json.dumps({"buttons": [], "inline": True}), None):
+        args = dict(peer_id=uid, conversation_message_id=cmid, message=text, disable_mentions=1)
+        if kb is not None:
+            args["keyboard"] = kb
+        try:
+            vk.messages.edit(**args)
+            return True
+        except ApiError as e:
+            log.info("Не удалось убрать кнопку (%s)", e)
+    return False
 
 
 def handle_event(obj: dict):
@@ -980,6 +1067,10 @@ def handle_event(obj: dict):
         db.execute("UPDATE trainings SET status='confirmed' WHERE id=?", (tid,))
         db.commit()
         answer_event(obj, "Записано в таблицу ✔")
+        uid = obj["user_id"]
+        remove_report_keyboard(uid, obj.get("conversation_message_id"), tid)
+        d_part, t_part = training_label(t)
+        send_dm(uid, f"Отчёт о тренировке {d_part} {t_part} в беседе {chat_title(t['peer_id'])} записан")
     else:
         answer_event(obj, "Не удалось записать в таблицу. Подробности в логе бота — попробуй ещё раз позже")
 
@@ -996,13 +1087,10 @@ def main():
         print(json.dumps(vk_session.method("messages.getReactionsAssets"), ensure_ascii=False, indent=2))
         return
 
-
     log.info("База данных: %s", os.path.abspath(DB_PATH) if DB_PATH != ":memory:" else DB_PATH)
     if os.path.isdir("/app/data") and not os.path.abspath(DB_PATH).startswith("/app/data"):
         log.warning("Каталог /app/data существует, но база лежит вне его — при обновлении/перезапуске "
                     "хостинга она может стереться. Задайте переменную DATA_DIR=/app/data")
-
-
     for k, v in REACTIONS.items():
         if v is None:
             log.warning("REACTION '%s' не настроена — реакция ставиться не будет", k)
@@ -1013,14 +1101,20 @@ def main():
             log.info("Бот запущен")
             for event in lp.listen():
                 try:
-                    if event.type == VkBotEventType.MESSAGE_NEW:
+                    etype = getattr(event.type, "value", event.type)
+                    if etype == "message_new":
                         msg = event.message
                         if msg["peer_id"] >= 2_000_000_000:
                             handle_chat(msg)
                         else:
                             handle_private(msg)
-                    elif event.type == VkBotEventType.MESSAGE_EVENT:
+                    elif etype == "message_event":
                         handle_event(event.object)
+                    elif etype == "message_edit":  # нужно включить событие в настройках Long Poll
+                        obj = event.object
+                        msg = obj.get("message", obj)
+                        if msg.get("peer_id", 0) >= 2_000_000_000:
+                            handle_chat_edit(msg)
                 except Exception:  # одно сообщение не должно ронять бота
                     log.exception("Ошибка обработки события")
         except Exception:

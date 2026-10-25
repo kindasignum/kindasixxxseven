@@ -12,6 +12,7 @@
     load_members(force=False) -> Members        — читает лист (кэш 5 минут)
     Members.trainer(vk_id)                      — персонаж тренера по «ID вк»
     Members.participant(name, vk_id=None)       — персонаж участника по «Имя на варе»
+                                                  (с автокоррекцией: без знаков → по первым двум словам)
 СЛУЖЕБНОЕ
     check_connection() -> dict                  — проверка доступа, создание листов
 
@@ -260,6 +261,15 @@ def norm_key(s) -> str:
     return " ".join(str(s).replace("\xa0", " ").casefold().replace("ё", "е").split())
 
 
+def clean_key(s) -> str:
+    """Только буквы и пробелы (знаки, цифры, подчёркивания удалены), без регистра, ё=е."""
+    return " ".join(re.sub(r"[^\w\s]|[\d_]", "", norm_key(s)).split())
+
+
+def first_two(key: str) -> str:
+    return " ".join(key.split()[:2])
+
+
 _VK_RE = re.compile(r"^(?:https?://)?(?:m\.)?(?:vk\.(?:com|ru)/)?(?:id)?(\d+)/?$", re.I)
 
 
@@ -281,12 +291,16 @@ class Members:
 
     def __init__(self, recs):
         self.recs = recs
-        self.by_vk, self.by_name = {}, {}
+        self.by_vk, self.by_name, self.by_clean, self.by_first2 = {}, {}, {}, {}
         for r in recs:
             if r["vk_id"]:
                 self.by_vk.setdefault(r["vk_id"], []).append(r)
             if r["name"]:
                 self.by_name.setdefault(norm_key(r["name"]), []).append(r)
+                ck = clean_key(r["name"])
+                if ck:
+                    self.by_clean.setdefault(ck, []).append(r)
+                    self.by_first2.setdefault(first_two(ck), []).append(r)
 
     def trainer(self, vk_id):
         """Персонаж тренера по VK ID («ID вк» → «ID вар», «Имя на варе»). None — не найден."""
@@ -297,16 +311,46 @@ class Members:
                         "ID вар — взята первая строка", vk_id)
         return recs[0] if recs else None
 
-    def participant(self, name, vk_id=None):
-        """Персонаж участника по имени («Имя на варе»). None — не найден или неоднозначно."""
-        cands = self.by_name.get(norm_key(name), [])
+    @staticmethod
+    def _pick(cands, vk_id):
+        """(запись, неоднозначно?). Несколько строк с одним и тем же ID вар — не конфликт."""
+        if not cands:
+            return None, False
         if len({str(r["cw_id"]) for r in cands}) <= 1:
-            return cands[0] if cands else None
+            return cands[0], False
         by_author = [r for r in cands if vk_id and r["vk_id"] == vk_id]
-        if len({str(r["cw_id"]) for r in by_author}) == 1:
-            return by_author[0]
-        log.warning("Имя «%s» неоднозначно на листе «Участники»", name)
-        return None
+        if by_author and len({str(r["cw_id"]) for r in by_author}) == 1:
+            return by_author[0], False
+        return None, True
+
+    def match_participant(self, name, vk_id=None):
+        """
+        Поиск персонажа по имени с автокоррекцией. Возвращает (запись | None, способ):
+          «exact»  — точное совпадение (регистр, ё/е и пробелы не важны);
+          «clean»  — совпало после удаления всех знаков, кроме букв и пробелов;
+          «first2» — совпало по первым двум словам;
+          None     — не найдено (автокоррекция невозможна → решает человек);
+          «ambiguous» — подходит несколько разных персонажей.
+        """
+        steps = (
+            ("exact", self.by_name, norm_key(name)),
+            ("clean", self.by_clean, clean_key(name)),
+            ("first2", self.by_first2, first_two(clean_key(name))),
+        )
+        for level, index, key in steps:
+            if not key:
+                continue
+            rec, ambiguous = self._pick(index.get(key, []), vk_id)
+            if rec:
+                return rec, level
+            if ambiguous:
+                log.warning("Имя «%s» неоднозначно на листе «Участники» (способ: %s)", name, level)
+                return None, "ambiguous"
+        return None, None
+
+    def participant(self, name, vk_id=None):
+        """Персонаж участника по имени («Имя на варе») с автокоррекцией. None — не найден."""
+        return self.match_participant(name, vk_id)[0]
 
 
 _members_cache = {"ts": 0.0, "data": None, "err": None}
