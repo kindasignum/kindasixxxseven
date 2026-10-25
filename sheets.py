@@ -329,6 +329,7 @@ class Members:
           «exact»  — точное совпадение (регистр, ё/е и пробелы не важны);
           «clean»  — совпало после удаления всех знаков, кроме букв и пробелов;
           «first2» — совпало по первым двум словам;
+          «first1» — совпало по первому слову (только если кандидат единственный);
           None     — не найдено (автокоррекция невозможна → решает человек);
           «ambiguous» — подходит несколько разных персонажей.
         """
@@ -336,6 +337,7 @@ class Members:
             ("exact", self.by_name, norm_key(name)),
             ("clean", self.by_clean, clean_key(name)),
             ("first2", self.by_first2, first_two(clean_key(name))),
+            ("first1", self.by_first1, first_one(clean_key(name))),
         )
         for level, index, key in steps:
             if not key:
@@ -347,10 +349,6 @@ class Members:
                 log.warning("Имя «%s» неоднозначно на листе «Участники» (способ: %s)", name, level)
                 return None, "ambiguous"
         return None, None
-
-    def participant(self, name, vk_id=None):
-        """Персонаж участника по имени («Имя на варе») с автокоррекцией. None — не найден."""
-        return self.match_participant(name, vk_id)[0]
 
 
 _members_cache = {"ts": 0.0, "data": None, "err": None}
