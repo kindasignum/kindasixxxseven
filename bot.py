@@ -43,6 +43,10 @@ if DB_PATH != ":memory:" and os.path.dirname(DB_PATH):
 MSK = ZoneInfo("Europe/Moscow")
 EDIT_LIMIT_SEC = 24 * 3600  # VK разрешает редактировать сообщения сутки
 JOIN_TOLERANCE_SEC = 6 * 3600  # насколько раньше старта допускается время прихода при правках
+# как часто (сек) перепроверять непонятные «#…»-сообщения на правки; 0 — отключить опрос
+EDIT_POLL_SEC = int(os.getenv("EDIT_POLL_SEC", "20"))
+# 1 — писать в лог тип каждого полученного события (для диагностики Long Poll)
+LOG_EVENTS = os.getenv("LOG_EVENTS", "0") == "1"
 # новые беседы по умолчанию включены (0 — выключены до команды «N вкл»)
 DEFAULT_CHAT_ENABLED = int(os.getenv("DEFAULT_CHAT_ENABLED", "1"))
 # запасной список админов сообщества (если VK не отдаёт список): VK ID через запятую
@@ -105,6 +109,15 @@ CREATE TABLE IF NOT EXISTS reports(
     cmid INTEGER,
     sent_ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS watched_msgs(
+    peer_id INTEGER NOT NULL,
+    cmid INTEGER NOT NULL,           -- сообщение с «#…», которое не распознано как команда
+    from_id INTEGER,
+    msg_date INTEGER,
+    text TEXT,                       -- текст, который видели в последний раз
+    added_ts INTEGER NOT NULL,
+    PRIMARY KEY (peer_id, cmid)
+);
 CREATE TABLE IF NOT EXISTS settings_msgs(
     user_id INTEGER PRIMARY KEY,     -- кто вызвал /настройка
     cmid INTEGER,                    -- последнее сообщение с настройками (его редактируем)
@@ -157,13 +170,12 @@ def norm_name(raw: str) -> str:
 
 
 def calc_points(minutes: int) -> float:
-    """До 75 минут — шаг 25 минут (0,5 балла за каждые полные 25 мин).
-    Начиная с 75 минут — шаг 30 минут.
+    """
+    До 75 минут шаг 25 минут, начиная с 75 — шаг 30 минут:
+    0–24 → 0; 25–49 → 0,5; 50–74 → 1; 75–104 → 1,5; 105–134 → 2; 135–164 → 2,5 и т.д.
     """
     if minutes < 75:
         return (minutes // 25) * 0.5
-    # 75 минут дают 1,5 балла (как и раньше: 75 // 25 = 3 → 1,5),
-    # дальше каждые полные 30 минут добавляют 0,5 балла.
     return 1.5 + ((minutes - 75) // 30) * 0.5
 
 
@@ -627,28 +639,91 @@ def process_join(peer: int, tr, uid: int, cmid, name: str, ts: int):
     react(peer, cmid, "eye")
 
 
-def handle_chat_edit(msg: dict):
+def handle_chat_edit(msg: dict, source: str = "событие") -> bool:
     """
     Отредактированное сообщение в беседе: если после правки это корректное «#лапа Имя» и тренировка
     сейчас идёт (начата и не закончена) — участник добавляется. Время прихода — время исходного
-    сообщения (но не раньше старта тренировки).
+    сообщения (но не раньше старта тренировки). True — участник добавлен/обновлён.
+    source — откуда узнали о правке: «событие» (message_edit) или «опрос».
     """
-    peer, uid, cmid = msg["peer_id"], msg.get("from_id", 0), msg.get("conversation_message_id")
+    peer, uid, cmid = msg.get("peer_id", 0), msg.get("from_id", 0), msg.get("conversation_message_id")
+    text = MENTION_RE.sub("", msg.get("text") or "").strip()
+    tag = f"правка {source}: беседа {peer}, сообщение {cmid}, текст {text[:60]!r}"
     if msg.get("action") or uid <= 0 or not cmid:
-        return
-    m = RE_JOIN.match(MENTION_RE.sub("", msg.get("text") or "").strip())
+        log.info("%s — пропущена (служебное сообщение или нет ID)", tag)
+        return False
+    m = RE_JOIN.match(text)
     if not m:
-        return
+        log.info("%s — пропущена: это не «#лапа Имя»", tag)
+        return False
     register_chat(peer)
     chat = get_chat(peer)
     if not chat or not chat["enabled"]:
-        return
+        log.info("%s — пропущена: беседа отключена в /настройка", tag)
+        return False
     tr = active_training(peer)
     if not tr:
-        return  # тренировка не начата или уже закончена
+        log.info("%s — пропущена: тренировка не идёт (не начата или уже закончена)", tag)
+        return False
+    if tr["start_cmid"] and cmid < tr["start_cmid"]:
+        log.info("%s — пропущена: сообщение отправлено до /старт текущей тренировки", tag)
+        return False
     name = norm_name(m.group(1))
-    if name:
-        process_join(peer, tr, uid, cmid, name, floor_min(msg.get("date") or int(time.time())))
+    if not name:
+        log.info("%s — пропущена: пустое имя", tag)
+        return False
+    process_join(peer, tr, uid, cmid, name, floor_min(msg.get("date") or int(time.time())))
+    log.info("%s — участник «%s» обработан", tag, name)
+    return True
+
+
+def watch_message(peer: int, uid: int, cmid, date: int, text: str):
+    """Запоминает непонятное «#…»-сообщение: если его потом исправят, опрос это заметит."""
+    if EDIT_POLL_SEC <= 0 or not cmid:
+        return
+    db.execute(
+        "INSERT OR IGNORE INTO watched_msgs(peer_id,cmid,from_id,msg_date,text,added_ts) VALUES(?,?,?,?,?,?)",
+        (peer, cmid, uid, date, text, int(time.time())),
+    )
+    db.commit()
+
+
+def poll_watched_messages():
+    """
+    Запасной способ ловить правки, не зависящий от доставки события message_edit: раз в
+    EDIT_POLL_SEC секунд перечитывает запомненные сообщения и, если текст изменился, обрабатывает их.
+    """
+    db.execute("DELETE FROM watched_msgs WHERE added_ts<?", (int(time.time()) - EDIT_LIMIT_SEC,))
+    for peer in [r["peer_id"] for r in db.execute("SELECT DISTINCT peer_id FROM watched_msgs")]:
+        tr = active_training(peer)
+        if not tr:  # тренировки нет — следить не за чем
+            db.execute("DELETE FROM watched_msgs WHERE peer_id=?", (peer,))
+            continue
+        # сообщения, отправленные до /старт нынешней тренировки (остатки прошлой), не считаются
+        db.execute("DELETE FROM watched_msgs WHERE peer_id=? AND cmid<?", (peer, tr["start_cmid"] or 0))
+        rows = db.execute("SELECT * FROM watched_msgs WHERE peer_id=?", (peer,)).fetchall()
+        for i in range(0, len(rows), 100):
+            chunk = rows[i:i + 100]
+            try:
+                r = vk.messages.getByConversationMessageId(
+                    peer_id=peer, conversation_message_ids=",".join(str(w["cmid"]) for w in chunk))
+            except ApiError as e:
+                log.warning("Опрос правок: не удалось прочитать сообщения беседы %s: %s", peer, e)
+                break
+            items = {it.get("conversation_message_id"): it for it in r.get("items", [])}
+            for w in chunk:
+                it = items.get(w["cmid"])
+                if not it:
+                    continue  # сообщение удалено
+                new = it.get("text") or ""
+                if new == w["text"]:
+                    continue
+                db.execute("UPDATE watched_msgs SET text=? WHERE peer_id=? AND cmid=?", (new, peer, w["cmid"]))
+                db.commit()
+                it = dict(it, peer_id=peer)
+                if handle_chat_edit(it, source="опрос"):
+                    db.execute("DELETE FROM watched_msgs WHERE peer_id=? AND cmid=?", (peer, w["cmid"]))
+    db.commit()
 
 
 def handle_chat(msg: dict):
@@ -747,6 +822,10 @@ def handle_chat(msg: dict):
         autocorrect_participants(tr["id"])
         send_new_report(tr["id"], [tr["leader_id"], uid])
         return
+
+    # «#…» во время тренировки, но команда не распознана (опечатка?) — присмотримся: вдруг исправят
+    if text.startswith("#"):
+        watch_message(peer, uid, cmid, msg["date"], text)
 
 
 # ───────────────────────── правки в ЛС ─────────────────────────
@@ -1082,6 +1161,52 @@ def handle_event(obj: dict):
 
 
 # ───────────────────────── запуск ─────────────────────────
+def dispatch_event(event):
+    """Разбор одного события Long Poll."""
+    try:
+        etype = str(getattr(event.type, "value", event.type))
+        if LOG_EVENTS and etype != "message_new":
+            log.info("Событие Long Poll: %s", etype)
+        if etype == "message_new":
+            msg = event.message
+            if msg["peer_id"] >= 2_000_000_000:
+                handle_chat(msg)
+            else:
+                handle_private(msg)
+        elif etype == "message_event":
+            handle_event(event.object)
+        elif etype == "message_edit":
+            obj = event.object
+            msg = obj.get("message", obj)  # в разных версиях API объект бывает «голым» или во вложении
+            log.info("Получено событие message_edit: беседа %s, сообщение %s",
+                     msg.get("peer_id"), msg.get("conversation_message_id"))
+            if msg.get("peer_id", 0) >= 2_000_000_000:
+                handle_chat_edit(msg)
+    except Exception:  # одно событие не должно ронять бота
+        log.exception("Ошибка обработки события")
+
+
+def check_longpoll_settings():
+    """Читает настройки Long Poll сообщества и предупреждает, если не включено нужное."""
+    try:
+        st = vk.groups.getLongPollSettings(group_id=GROUP_ID)
+    except ApiError as e:
+        log.warning("Не удалось прочитать настройки Long Poll (%s). Нужен ключ с правом «управление "
+                    "сообществом». Проверьте вручную: Управление → Работа с API → Long Poll API", e)
+        return
+    ev = st.get("events", {})
+    log.info("Long Poll: включён=%s, версия API=%s, message_new=%s, message_edit=%s, message_event=%s",
+             st.get("is_enabled"), st.get("api_version"), ev.get("message_new"),
+             ev.get("message_edit"), ev.get("message_event"))
+    if not st.get("is_enabled"):
+        log.warning("Long Poll API в сообществе ВЫКЛЮЧЕН")
+    if not ev.get("message_edit"):
+        log.warning("В Long Poll не включено событие «Редактирование сообщения» (message_edit): "
+                    "правки #лапа будут ловиться только запасным опросом раз в %s с", EDIT_POLL_SEC)
+    if not ev.get("message_event"):
+        log.warning("В Long Poll не включено событие message_event — кнопка «Подтвердить» не заработает")
+
+
 def main():
     global vk_session, vk
     if not TOKEN or not GROUP_ID:
@@ -1101,28 +1226,22 @@ def main():
         if v is None:
             log.warning("REACTION '%s' не настроена — реакция ставиться не будет", k)
 
+    check_longpoll_settings()
     while True:
         try:
-            lp = VkBotLongPoll(vk_session, GROUP_ID)
-            log.info("Бот запущен")
-            for event in lp.listen():
-                try:
-                    etype = getattr(event.type, "value", event.type)
-                    if etype == "message_new":
-                        msg = event.message
-                        if msg["peer_id"] >= 2_000_000_000:
-                            handle_chat(msg)
-                        else:
-                            handle_private(msg)
-                    elif etype == "message_event":
-                        handle_event(event.object)
-                    elif etype == "message_edit":  # нужно включить событие в настройках Long Poll
-                        obj = event.object
-                        msg = obj.get("message", obj)
-                        if msg.get("peer_id", 0) >= 2_000_000_000:
-                            handle_chat_edit(msg)
-                except Exception:  # одно сообщение не должно ронять бота
-                    log.exception("Ошибка обработки события")
+            lp = VkBotLongPoll(vk_session, GROUP_ID, wait=10)
+            log.info("Бот запущен (опрос правок: %s)",
+                     f"каждые {EDIT_POLL_SEC} с" if EDIT_POLL_SEC > 0 else "выключен")
+            last_poll = 0.0
+            while True:
+                for event in lp.check():
+                    dispatch_event(event)
+                if EDIT_POLL_SEC > 0 and time.time() - last_poll >= EDIT_POLL_SEC:
+                    last_poll = time.time()
+                    try:
+                        poll_watched_messages()
+                    except Exception:
+                        log.exception("Ошибка опроса правок")
         except Exception:
             log.exception("Long Poll упал, перезапуск через 5 секунд")
             time.sleep(5)

@@ -56,3 +56,14 @@ CREATE TABLE IF NOT EXISTS settings_msgs(
     sent_ts INTEGER,
     text    TEXT
 );
+
+-- Непонятные «#…»-сообщения во время тренировки: бот перечитывает их и ловит правки (#лапа с опечаткой)
+CREATE TABLE IF NOT EXISTS watched_msgs(
+    peer_id  INTEGER NOT NULL,
+    cmid     INTEGER NOT NULL,
+    from_id  INTEGER,
+    msg_date INTEGER,
+    text     TEXT,
+    added_ts INTEGER NOT NULL,
+    PRIMARY KEY (peer_id, cmid)
+);

@@ -12,7 +12,7 @@
     load_members(force=False) -> Members        — читает лист (кэш 5 минут)
     Members.trainer(vk_id)                      — персонаж тренера по «ID вк»
     Members.participant(name, vk_id=None)       — персонаж участника по «Имя на варе»
-                                                  (с автокоррекцией: без знаков → по первым двум словам)
+                                                  (с автокоррекцией: без знаков → по двум словам → по первому слову)
 СЛУЖЕБНОЕ
     check_connection() -> dict                  — проверка доступа, создание листов
 
@@ -270,6 +270,10 @@ def first_two(key: str) -> str:
     return " ".join(key.split()[:2])
 
 
+def first_word(key: str) -> str:
+    return " ".join(key.split()[:1])
+
+
 _VK_RE = re.compile(r"^(?:https?://)?(?:m\.)?(?:vk\.(?:com|ru)/)?(?:id)?(\d+)/?$", re.I)
 
 
@@ -291,7 +295,7 @@ class Members:
 
     def __init__(self, recs):
         self.recs = recs
-        self.by_vk, self.by_name, self.by_clean, self.by_first2 = {}, {}, {}, {}
+        self.by_vk, self.by_name, self.by_clean, self.by_first2, self.by_first1 = {}, {}, {}, {}, {}
         for r in recs:
             if r["vk_id"]:
                 self.by_vk.setdefault(r["vk_id"], []).append(r)
@@ -301,6 +305,7 @@ class Members:
                 if ck:
                     self.by_clean.setdefault(ck, []).append(r)
                     self.by_first2.setdefault(first_two(ck), []).append(r)
+                    self.by_first1.setdefault(first_word(ck), []).append(r)
 
     def trainer(self, vk_id):
         """Персонаж тренера по VK ID («ID вк» → «ID вар», «Имя на варе»). None — не найден."""
@@ -329,7 +334,7 @@ class Members:
           «exact»  — точное совпадение (регистр, ё/е и пробелы не важны);
           «clean»  — совпало после удаления всех знаков, кроме букв и пробелов;
           «first2» — совпало по первым двум словам;
-          «first1» — совпало по первому слову (только если кандидат единственный);
+          «first1» — совпало по первому слову (если по двум не нашлось);
           None     — не найдено (автокоррекция невозможна → решает человек);
           «ambiguous» — подходит несколько разных персонажей.
         """
@@ -337,7 +342,7 @@ class Members:
             ("exact", self.by_name, norm_key(name)),
             ("clean", self.by_clean, clean_key(name)),
             ("first2", self.by_first2, first_two(clean_key(name))),
-            ("first1", self.by_first1, first_one(clean_key(name))),
+            ("first1", self.by_first1, first_word(clean_key(name))),
         )
         for level, index, key in steps:
             if not key:
@@ -349,6 +354,10 @@ class Members:
                 log.warning("Имя «%s» неоднозначно на листе «Участники» (способ: %s)", name, level)
                 return None, "ambiguous"
         return None, None
+
+    def participant(self, name, vk_id=None):
+        """Персонаж участника по имени («Имя на варе») с автокоррекцией. None — не найден."""
+        return self.match_participant(name, vk_id)[0]
 
 
 _members_cache = {"ts": 0.0, "data": None, "err": None}
