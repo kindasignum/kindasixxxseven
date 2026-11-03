@@ -159,6 +159,11 @@ def ensure_column(table: str, col: str, ddl: str):
 ensure_column("chats", "self_gov_days", "TEXT NOT NULL DEFAULT ''")
 ensure_column("reports", "note", "TEXT")
 ensure_column("reports", "page", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("trainings", "kind", "TEXT NOT NULL DEFAULT 'group'")  # group | individual
+db.execute(
+    "CREATE TABLE IF NOT EXISTS menu_state("
+    "user_id INTEGER PRIMARY KEY, role TEXT NOT NULL DEFAULT '', ts INTEGER NOT NULL)"
+)
 db.execute(
     "CREATE TABLE IF NOT EXISTS edit_sessions("
     "user_id INTEGER PRIMARY KEY, training_id INTEGER NOT NULL, kind TEXT NOT NULL, "
@@ -419,30 +424,45 @@ def is_chat_admin(peer_id: int, uid: int) -> bool:
     return False
 
 
-_group_admins = {"ts": 0.0, "ids": set()}
+_group_roles = {"ts": 0.0, "roles": {}}
+ADMIN_ROLES = ("creator", "administrator")
+MODER_ROLES = ADMIN_ROLES + ("editor", "moderator")  # «модератор и выше»
 
 
-def group_admin_ids() -> set:
-    """Создатель и администраторы сообщества (+ запасной список BOT_ADMIN_IDS); кэш на 5 минут."""
-    if time.time() - _group_admins["ts"] > 300:
-        ids = set()
+def group_roles() -> dict:
+    """{VK ID: роль} руководителей сообщества; кэш на 5 минут."""
+    if time.time() - _group_roles["ts"] > 300:
+        roles = {}
         try:
             r = vk.groups.getMembers(group_id=GROUP_ID, filter="managers")
             for it in r.get("items", []):
                 if isinstance(it, dict):
-                    if it.get("role") in ("creator", "administrator"):
-                        ids.add(it["id"])
+                    roles[it["id"]] = it.get("role")
                 else:
-                    ids.add(it)
+                    roles[it] = "administrator"
         except ApiError as e:
             log.warning("Не удалось получить руководителей сообщества: %s "
                         "(можно задать BOT_ADMIN_IDS в .env)", e)
-        _group_admins.update(ts=time.time(), ids=ids)
-    return set(_group_admins["ids"]) | ENV_ADMIN_IDS
+        _group_roles.update(ts=time.time(), roles=roles)
+    return _group_roles["roles"]
+
+
+def group_admin_ids() -> set:
+    """Создатель и администраторы сообщества (+ запасной список BOT_ADMIN_IDS)."""
+    return {u for u, r in group_roles().items() if r in ADMIN_ROLES} | ENV_ADMIN_IDS
+
+
+def group_moderator_ids() -> set:
+    """Модераторы, редакторы, администраторы и создатель сообщества (+ BOT_ADMIN_IDS)."""
+    return {u for u, r in group_roles().items() if r in MODER_ROLES} | ENV_ADMIN_IDS
 
 
 def is_group_admin(uid: int) -> bool:
     return uid in group_admin_ids()
+
+
+def is_group_moderator(uid: int) -> bool:
+    return uid in group_moderator_ids()
 
 
 # ───────────────────────── тренеры ─────────────────────────
@@ -485,6 +505,10 @@ def trainer_link(r, name: str) -> str:
 
 
 # ───────────────────────── Google Таблица ─────────────────────────
+def training_chat_title(t) -> str:
+    return "Индивидуальная тренировка" if t["kind"] == "individual" else chat_title(t["peer_id"])
+
+
 def build_training_payload(training_id: int) -> dict:
     """
     Данные тренировки для sheets.write_training(). CW ID тренера берётся с листа «Участники»
@@ -518,9 +542,11 @@ def build_training_payload(training_id: int) -> dict:
         leader_id, leader_name = ", ".join(map(str, ids)), ", ".join(names)
         leader_cw = ", ".join(map(str, cws))
     return {
-        "key": f"{t['peer_id']}-{t['start_ts']}",
+        "key": (f"ind-{t['peer_id']}-{t['start_ts']}-{t['id']}" if t["kind"] == "individual"
+                else f"{t['peer_id']}-{t['start_ts']}"),
         "start": dt(t["start_ts"]), "end": dt(t["end_ts"]),
-        "chat_id": t["peer_id"] - 2_000_000_000, "chat_title": chat_title(t["peer_id"]),
+        "chat_id": 0 if t["kind"] == "individual" else t["peer_id"] - 2_000_000_000,
+        "chat_title": training_chat_title(t),
         "leader_id": leader_id, "leader_name": leader_name, "leader_cw_id": leader_cw,
         "participants": parts,
     }
@@ -574,7 +600,8 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
         )
 
     d_part, t_part = training_label(t)
-    head = f"Тренировка {d_part}. {t_part}"
+    indiv = t["kind"] == "individual"
+    head = ("Индивидуальная тренировка " if indiv else "Тренировка ") + f"{d_part}. {t_part}"
     # «Участники» — кто не уходил раньше конца тренировки; «Ушли досрочно» — остальные
     stayed = [line(p) for p in parts if p["leave_ts"] >= t["end_ts"]]
     early = [line(p) for p in parts if p["leave_ts"] < t["end_ts"]]
@@ -602,7 +629,7 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
         out += [f"ℹ {note}", ""]
     out += [
         head,
-        f"Беседа: {chat_title(t['peer_id'])}",
+        *([] if indiv else [f"Беседа: {chat_title(t['peer_id'])}"]),
         "",
         *trainer_lines,
         "",
@@ -674,6 +701,8 @@ def confirm_kb(tid: int, page: int = 0) -> str:
     kb.add_callback_button("Добавить участника", sec, payload={"cmd": "rp_add", "tid": tid})
     if page < pages - 1:
         kb.add_callback_button("▶", sec, payload={"cmd": "rp_page", "tid": tid, "pg": page + 1})
+    kb.add_line()
+    kb.add_callback_button("Изменить время тренировки", sec, payload={"cmd": "rp_time", "tid": tid})
     kb.add_line()
     kb.add_callback_button(
         "Подтвердить", VkKeyboardColor.POSITIVE, payload={"cmd": "confirm", "tid": tid}
@@ -1418,15 +1447,171 @@ def apply_session_lines(sess, lines):
     apply_edits(tid, conv)
 
 
+RE_DATE = r"(?:(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\s+)?"  # необязательная дата «24.10» / «24.10.2026»
+RE_TIMERANGE = re.compile(rf"^(?:время\s+)?{RE_DATE}{TIME}\s*[-–—]\s*{TIME}$", re.I)
+RE_INDIV = re.compile(rf"^{RE_DATE}{TIME}\s*[-–—]\s*{TIME}\s+(.+)$", re.S)
+RE_MENTION_ID = re.compile(r"^\[id(\d+)\|[^\]]*\]$", re.I)
+
+TIME_TEXT = (
+    "Отправь новое время тренировки ответным сообщением:\n\n"
+    "15:00-16:30\n"
+    "24.10.2026 15:00-16:30 — если нужно изменить и дату\n\n"
+    "Те, кто был на тренировке с самого начала или до конца, сдвинутся вместе с ней; остальные "
+    "подрежутся по новым границам. Чтобы отменить, нажми «Вернуться»."
+)
+IND_TEXT = (
+    "Индивидуальная тренировка. Отправь одним сообщением дату, время и тренирующегося:\n\n"
+    "24.10.2026 15:00-16:30 Лихушек\n"
+    "24.10 15:00-16:30 id123456\n\n"
+    "Тренирующийся — имя на варе, ID ВК или ссылка на страницу. Дату можно не указывать — тогда возьмётся "
+    "сегодняшняя. Тренером запишешься ты (в отчёте это можно поменять). Чтобы отменить, нажми «Вернуться»."
+)
+
+
+def build_range(dd, mo, yy, h1, m1, h2, m2, base_ts: int, prefer_past: bool = False):
+    """
+    «[дата] ЧЧ:ММ-ЧЧ:ММ» → (начало, конец) в unix-времени. Без даты берутся сутки base_ts
+    (prefer_past — если время получилось в будущем больше чем на час, берутся вчерашние сутки).
+    Конец раньше начала — это переход через полночь.
+    """
+    h1, m1, h2, m2 = int(h1), int(m1), int(h2), int(m2)
+    if h1 > 23 or h2 > 23 or m1 > 59 or m2 > 59:
+        raise EditError("некорректное время")
+    if (h1, m1) == (h2, m2):
+        raise EditError("начало и конец совпадают")
+    if dd:
+        year = int(yy) if yy else dt(base_ts).year
+        year += 2000 if year < 100 else 0
+        try:
+            d0 = datetime(year, int(mo), int(dd), h1, m1, tzinfo=MSK)
+        except ValueError:
+            raise EditError("некорректная дата")
+    else:
+        d0 = dt(base_ts).replace(hour=h1, minute=m1, second=0, microsecond=0)
+        if prefer_past and int(d0.timestamp()) > base_ts + 3600:
+            d0 -= timedelta(days=1)
+    d1 = d0.replace(hour=h2, minute=m2)
+    if d1 <= d0:
+        d1 += timedelta(days=1)
+    return int(d0.timestamp()), int(d1.timestamp())
+
+
+def set_training_time(tid: int, ns: int, ne: int):
+    """
+    Меняет общее время тренировки. Те, кто пришёл ровно в старт / ушёл ровно в конец (в т.ч. «ушли по /стоп»),
+    переезжают на новые границы; остальных подрезаем, чтобы они не выходили за новую тренировку.
+    """
+    t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
+    os_, oe = t["start_ts"], t["end_ts"]
+    with db:
+        for tbl in ("participants", "trainers"):
+            q = f"UPDATE {tbl} SET "
+            db.execute(q + "join_ts=? WHERE training_id=? AND join_ts=?", (ns, tid, os_))
+            db.execute(q + "leave_ts=? WHERE training_id=? AND leave_ts=?", (ne, tid, oe))
+            db.execute(q + "join_ts=? WHERE training_id=? AND join_ts<?", (ns, tid, ns))
+            db.execute(q + "join_ts=? WHERE training_id=? AND join_ts>?", (ne, tid, ne))
+            db.execute(q + "leave_ts=? WHERE training_id=? AND leave_ts>?", (ne, tid, ne))
+            db.execute(q + "leave_ts=join_ts WHERE training_id=? AND leave_ts<join_ts", (tid,))
+        db.execute("UPDATE trainings SET start_ts=?, end_ts=? WHERE id=?", (ns, ne, tid))
+
+
+def resolve_trainee(arg: str):
+    """Имя на варе, ID ВК, «id123», ссылка или [id123|Имя] → (VK ID | None, имя)."""
+    arg = arg.strip()
+    members = get_members()
+    m = RE_VK_REF.match(arg) or RE_MENTION_ID.match(arg) or re.fullmatch(r"(\d+)", arg)
+    if m:
+        vk_id = int(m.group(1))
+        rec = members.trainer(vk_id) if members else None
+        return vk_id, (rec["name"] if rec and rec["name"] else user_name(vk_id))
+    name = norm_name(arg)
+    if not name:
+        raise EditError("пустое имя")
+    rec = members.participant(name) if members else None
+    if rec:
+        return rec["vk_id"], rec["name"] or name
+    return None, name
+
+
+def create_individual(uid: int, start_ts: int, end_ts: int, vk_id, name: str) -> int:
+    """Индивидуальная тренировка: сразу завершена; тренер — модератор, тренирующийся — на всю тренировку."""
+    cur = db.execute(
+        "INSERT INTO trainings(peer_id,leader_id,stopper_id,start_ts,end_ts,status,kind) "
+        "VALUES(?,?,?,?,?,'finished','individual')", (uid, uid, uid, start_ts, end_ts))
+    tid = cur.lastrowid
+    db.execute("INSERT INTO trainers(training_id,num,vk_id,join_ts,leave_ts) VALUES(?,?,?,?,?)",
+               (tid, 1, uid, start_ts, end_ts))
+    db.execute("INSERT INTO participants(training_id,num,vk_id,name,join_ts,leave_ts,auto_leave) "
+               "VALUES(?,?,?,?,?,?,1)", (tid, 1, vk_id, name, start_ts, end_ts))
+    db.commit()
+    return tid
+
+
+def start_individual(uid: int):
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("Вернуться", VkKeyboardColor.SECONDARY, payload={"cmd": "rp_back"})
+    open_session(uid, 0, "indiv", None, IND_TEXT, kb.get_keyboard())
+
+
+def handle_indiv_msg(uid: int, cmid, sess, lines) -> bool:
+    if not is_group_moderator(uid):
+        clear_session(uid)
+        return False
+    m = RE_INDIV.match(lines[0]) if len(lines) == 1 else None
+    if not m:
+        react(uid, cmid, "question")
+        return True
+    try:
+        start, end = build_range(*m.groups()[:7], base_ts=int(time.time()), prefer_past=True)
+        vk_id, name = resolve_trainee(m.group(8))
+    except EditError as e:
+        log.info("Индивидуальная тренировка отклонена: %s", e)
+        react(uid, cmid, "question")
+        return True
+    tid = create_individual(uid, start, end, vk_id, name)
+    autocorrect_participants(tid)
+    react(uid, cmid, "check")
+    delete_msg(uid, sess["cmid"])
+    clear_session(uid, sess["cmid"])
+    send_report_message(tid, uid)
+    return True
+
+
+def handle_time_msg(uid: int, cmid, sess, t, lines) -> bool:
+    m = RE_TIMERANGE.match(lines[0]) if len(lines) == 1 else None
+    if not m:
+        react(uid, cmid, "question")
+        return True
+    try:
+        ns, ne = build_range(*m.groups(), base_ts=t["start_ts"])
+        set_training_time(t["id"], ns, ne)
+    except EditError as e:
+        log.info("Правка времени отклонена: %s", e)
+        react(uid, cmid, "question")
+        return True
+    update_all_reports(t["id"])
+    react(uid, cmid, "check")
+    delete_msg(uid, sess["cmid"])
+    clear_session(uid, sess["cmid"])
+    return True
+
+
 def handle_session_msg(uid: int, cmid, lines) -> bool:
     """Сообщение пользователя при открытом сообщении правок. True — обработано, False — разбирать по-старому."""
     sess = get_session(uid)
     if not sess:
         return False
-    t = db.execute("SELECT * FROM trainings WHERE id=?", (sess["training_id"],)).fetchone()
-    if not t or t["status"] == "confirmed" or time.time() - sess["ts"] > EDIT_LIMIT_SEC:
+    if time.time() - sess["ts"] > EDIT_LIMIT_SEC:
         clear_session(uid)
         return False
+    if sess["kind"] == "indiv":
+        return handle_indiv_msg(uid, cmid, sess, lines)
+    t = db.execute("SELECT * FROM trainings WHERE id=?", (sess["training_id"],)).fetchone()
+    if not t or t["status"] == "confirmed":
+        clear_session(uid)
+        return False
+    if sess["kind"] == "time":
+        return handle_time_msg(uid, cmid, sess, t, lines)
     if sess["kind"] != "add" and not all(RE_S_NAME.match(l) or RE_S_TIME.match(l) for l in lines):
         return False
     tid = sess["training_id"]
@@ -1444,6 +1629,67 @@ def handle_session_msg(uid: int, cmid, lines) -> bool:
             edit_msg(uid, sess["cmid"], text, entry_kb(tid, sess["kind"], sess["num"]))
     react(uid, cmid, "check")
     return True
+
+
+# ───────────────────────── меню (постоянные кнопки над полем ввода) ─────────────────────────
+MENU_SETTINGS, MENU_INDIV = "Настройка", "Индивидуальная тренировка"
+
+
+def menu_role(uid: int) -> str:
+    return "admin" if is_group_admin(uid) else ("mod" if is_group_moderator(uid) else "")
+
+
+def menu_kb(role: str) -> str:
+    kb = VkKeyboard(one_time=False)
+    if role == "admin":
+        kb.add_button(MENU_SETTINGS, VkKeyboardColor.SECONDARY)
+        kb.add_line()
+    kb.add_button(MENU_INDIV, VkKeyboardColor.SECONDARY)
+    return kb.get_keyboard()
+
+
+def ensure_menu(uid: int, force: bool = False):
+    """Показывает пользователю меню по его роли (один раз; снова — если роль изменилась). Ошибки не пробрасывает."""
+    if uid <= 0:
+        return
+    try:
+        role = menu_role(uid)
+        row = db.execute("SELECT role FROM menu_state WHERE user_id=?", (uid,)).fetchone()
+        old = row["role"] if row else ""
+        if role == old and not (force and role):
+            return
+        if role:
+            names = f"«{MENU_SETTINGS}» и «{MENU_INDIV}»" if role == "admin" else f"«{MENU_INDIV}»"
+            text, kb = f"Меню включено: {names} всегда под рукой над полем ввода.", menu_kb(role)
+        else:
+            text, kb = "Меню скрыто: у тебя больше нет доступа к его функциям.", json.dumps(
+                {"buttons": [], "one_time": True})
+        vk.messages.send(peer_id=uid, random_id=random.getrandbits(31), message=text,
+                         keyboard=kb, disable_mentions=1)
+        db.execute("INSERT OR REPLACE INTO menu_state(user_id,role,ts) VALUES(?,?,?)",
+                   (uid, role, int(time.time())))
+        db.commit()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось показать меню %s: %s", uid, e)
+
+
+def handle_menu(msg: dict) -> bool:
+    """Нажатия кнопок меню (они приходят обычными сообщениями) и команда /меню. True — обработано."""
+    uid = msg["from_id"]
+    text = (msg.get("text") or "").strip().casefold()
+    if text in ("/меню", "меню"):
+        if menu_role(uid):
+            ensure_menu(uid, force=True)
+            return True
+    elif text == MENU_SETTINGS.casefold():
+        if is_group_admin(uid):
+            show_settings(uid, force_new=True)
+            return True
+    elif text == MENU_INDIV.casefold():
+        if is_group_moderator(uid):
+            start_individual(uid)
+            return True
+    return False
 
 
 def find_report(uid: int, msg: dict):
@@ -1800,6 +2046,9 @@ def handle_private(msg: dict):
     uid, cmid = msg["from_id"], msg.get("conversation_message_id")
     if uid <= 0:
         return
+    ensure_menu(uid)
+    if handle_menu(msg):
+        return
     if handle_settings(msg):
         return
     lines = [l.strip() for l in (msg.get("text") or "").splitlines() if l.strip()]
@@ -1902,6 +2151,10 @@ def handle_report_event(obj: dict):
             if not text:
                 return answer_event(obj, "Не найден (возможно, уже удалён)")
             open_session(uid, tid, k, n, text, entry_kb(tid, k, n))
+        elif cmd == "rp_time":
+            kb = VkKeyboard(inline=True)
+            kb.add_callback_button("Вернуться", VkKeyboardColor.SECONDARY, payload={"cmd": "rp_back"})
+            open_session(uid, tid, "time", None, TIME_TEXT, kb.get_keyboard())
         elif cmd == "rp_add":
             kb = VkKeyboard(inline=True)
             kb.add_callback_button("Вернуться", VkKeyboardColor.SECONDARY, payload={"cmd": "rp_back"})
@@ -1954,7 +2207,7 @@ def handle_event(obj: dict):
 
     confirmer = user_link(uid)
     d_part, t_part = training_label(t)
-    done_text = f"Отчёт о тренировке {d_part} {t_part} в беседе {chat_title(t['peer_id'])} записан"
+    done_text = f"Отчёт о тренировке {d_part} {t_part} {'(индивидуальная)' if t['kind'] == 'individual' else 'в беседе ' + chat_title(t['peer_id'])} записан"
     done_sent = False
     for rep in reps:  # кнопка убирается во ВСЕХ отправленных сообщениях с отчётом
         edited = strip_report_button(rep, confirmer)
@@ -1984,6 +2237,7 @@ def dispatch_event(event):
                 handle_private(msg)
         elif etype == "message_event":
             handle_event(event.object)
+            ensure_menu(event.object.get("user_id", 0))
         elif etype == "message_edit":
             obj = event.object
             msg = obj.get("message", obj)  # в разных версиях API объект бывает «голым» или во вложении

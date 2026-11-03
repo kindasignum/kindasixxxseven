@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS trainings(
     start_ts    INTEGER NOT NULL,                  -- unix-время начала (UTC)
     end_ts      INTEGER,                           -- unix-время окончания
     status      TEXT NOT NULL DEFAULT 'active',    -- active | finished | confirmed
-    start_cmid  INTEGER                            -- номер сообщения /старт в беседе
+    start_cmid  INTEGER,                           -- номер сообщения /старт в беседе
+    kind        TEXT NOT NULL DEFAULT 'group'      -- group — в беседе; individual — индивидуальная (peer_id = VK ID модератора)
 );
 
 CREATE TABLE IF NOT EXISTS participants(
@@ -90,13 +91,21 @@ CREATE TABLE IF NOT EXISTS msg_log(
 CREATE TABLE IF NOT EXISTS edit_sessions(
     user_id     INTEGER PRIMARY KEY,           -- кто правит отчёт
     training_id INTEGER NOT NULL,
-    kind        TEXT NOT NULL,                 -- p — участник, t — тренер, add — добавление
+    kind        TEXT NOT NULL,                 -- p — участник, t — тренер, add — добавление, time — время тренировки, indiv — индивидуальная (training_id = 0)
     num         INTEGER,                       -- номер участника/тренера в отчёте (для add — NULL)
     cmid        INTEGER,                       -- сообщение бота с кнопками правок
     ts          INTEGER NOT NULL
+);
+
+-- Какое меню (постоянные кнопки над полем ввода) показано пользователю: admin | mod | пусто
+CREATE TABLE IF NOT EXISTS menu_state(
+    user_id INTEGER PRIMARY KEY,
+    role    TEXT NOT NULL DEFAULT '',
+    ts      INTEGER NOT NULL
 );
 
 -- Добавлено в более старые таблицы (бот делает это сам при запуске):
 --   ALTER TABLE chats   ADD COLUMN self_gov_days TEXT NOT NULL DEFAULT '';   -- дни самоуправления «0,2,5» (пн=0)
 --   ALTER TABLE reports ADD COLUMN note TEXT;                                -- пояснение вверху отчёта
 --   ALTER TABLE reports ADD COLUMN page INTEGER NOT NULL DEFAULT 0;          -- страница кнопок правок
+--   ALTER TABLE trainings ADD COLUMN kind TEXT NOT NULL DEFAULT 'group';     -- group | individual
