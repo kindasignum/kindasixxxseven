@@ -107,14 +107,27 @@ CREATE TABLE IF NOT EXISTS reports(
     user_id INTEGER NOT NULL,
     message_id INTEGER,
     cmid INTEGER,
-    sent_ts INTEGER NOT NULL
+    sent_ts INTEGER NOT NULL,
+    note TEXT                        -- пояснение вверху отчёта (почему отчёт пришёл именно вам)
 );
-CREATE TABLE IF NOT EXISTS watched_msgs(
+CREATE TABLE IF NOT EXISTS trainers(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    training_id INTEGER NOT NULL,
+    num INTEGER NOT NULL,            -- постоянный номер тренера в отчёте
+    vk_id INTEGER,                   -- NULL — добавлен вручную без страницы ВК
+    name TEXT,                       -- NULL — взять из листа «Участники» / из ВК
+    join_ts INTEGER NOT NULL,
+    leave_ts INTEGER,
+    join_cmid INTEGER,
+    leave_cmid INTEGER
+);
+CREATE TABLE IF NOT EXISTS msg_log(
     peer_id INTEGER NOT NULL,
-    cmid INTEGER NOT NULL,           -- сообщение с «#…», которое не распознано как команда
+    cmid INTEGER NOT NULL,
     from_id INTEGER,
-    msg_date INTEGER,
-    text TEXT,                       -- текст, который видели в последний раз
+    date INTEGER,
+    text TEXT,                       -- последний известный текст сообщения
+    recognized INTEGER NOT NULL DEFAULT 1,  -- 0 — команда не сработала: следим, не исправят ли
     added_ts INTEGER NOT NULL,
     PRIMARY KEY (peer_id, cmid)
 );
@@ -130,10 +143,21 @@ CREATE TABLE IF NOT EXISTS chats(
     enabled INTEGER NOT NULL DEFAULT 1,      -- учёт баллов в беседе
     free_run INTEGER NOT NULL DEFAULT 0,     -- свободный бег (задел на будущее)
     admins_only INTEGER NOT NULL DEFAULT 0,  -- тренировки ведут только админы беседы
-    added_ts INTEGER
+    added_ts INTEGER,
+    self_gov_days TEXT NOT NULL DEFAULT ''   -- дни самоуправления: «0,2,5» (пн=0 … вс=6), пусто — отключено
 );
 """
 )
+
+
+def ensure_column(table: str, col: str, ddl: str):
+    """Миграция: добавляет столбец в таблицу, созданную более старой версией бота."""
+    if col not in [r["name"] for r in db.execute(f"PRAGMA table_info({table})")]:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+
+ensure_column("chats", "self_gov_days", "TEXT NOT NULL DEFAULT ''")
+ensure_column("reports", "note", "TEXT")
 db.commit()
 
 # ───────────────────────── утилиты ─────────────────────────
@@ -392,10 +416,8 @@ def is_chat_admin(peer_id: int, uid: int) -> bool:
 _group_admins = {"ts": 0.0, "ids": set()}
 
 
-def is_group_admin(uid: int) -> bool:
-    """Создатель или администратор сообщества (+ запасной список BOT_ADMIN_IDS)."""
-    if uid in ENV_ADMIN_IDS:
-        return True
+def group_admin_ids() -> set:
+    """Создатель и администраторы сообщества (+ запасной список BOT_ADMIN_IDS); кэш на 5 минут."""
     if time.time() - _group_admins["ts"] > 300:
         ids = set()
         try:
@@ -410,7 +432,50 @@ def is_group_admin(uid: int) -> bool:
             log.warning("Не удалось получить руководителей сообщества: %s "
                         "(можно задать BOT_ADMIN_IDS в .env)", e)
         _group_admins.update(ts=time.time(), ids=ids)
-    return uid in _group_admins["ids"]
+    return set(_group_admins["ids"]) | ENV_ADMIN_IDS
+
+
+def is_group_admin(uid: int) -> bool:
+    return uid in group_admin_ids()
+
+
+# ───────────────────────── тренеры ─────────────────────────
+def trainer_rows(tid: int):
+    return db.execute("SELECT * FROM trainers WHERE training_id=? ORDER BY num", (tid,)).fetchall()
+
+
+def ensure_trainers(t):
+    """Тренировки, начатые старой версией бота: единственный тренер — тот, кто написал /старт."""
+    if db.execute("SELECT 1 FROM trainers WHERE training_id=?", (t["id"],)).fetchone():
+        return
+    db.execute(
+        "INSERT INTO trainers(training_id,num,vk_id,join_ts,leave_ts,join_cmid) VALUES(?,?,?,?,?,?)",
+        (t["id"], 1, t["leader_id"], t["start_ts"], t["end_ts"], t["start_cmid"]),
+    )
+    db.commit()
+
+
+def trainer_view(r, members):
+    """(имя для отчёта, CW ID, найден ли на листе «Участники»)."""
+    rec = None
+    if members:
+        if r["vk_id"]:
+            rec = members.trainer(r["vk_id"])
+        elif r["name"]:
+            rec = members.participant(r["name"])
+    if r["name"]:
+        name = r["name"]
+    elif rec and rec["name"]:
+        name = rec["name"]
+    elif r["vk_id"]:
+        name = user_name(r["vk_id"])
+    else:
+        name = "Тренер"
+    return name, (rec["cw_id"] if rec else ""), bool(rec)
+
+
+def trainer_link(r, name: str) -> str:
+    return f"[id{r['vk_id']}|{name}]" if r["vk_id"] else name
 
 
 # ───────────────────────── Google Таблица ─────────────────────────
@@ -418,10 +483,13 @@ def build_training_payload(training_id: int) -> dict:
     """
     Данные тренировки для sheets.write_training(). CW ID тренера берётся с листа «Участники»
     по VK ID («ID вк» → «ID вар»), CW ID участника — по имени («Имя на варе»).
+    Если тренеров несколько, их данные записываются в одну ячейку через запятую.
     """
     t = db.execute("SELECT * FROM trainings WHERE id=?", (training_id,)).fetchone()
     members = get_members()
-    lead_name, lead_cw, _ = trainer_info(members, t["leader_id"])
+    ensure_trainers(t)
+    trs = trainer_rows(training_id)
+    views = [(r, *trainer_view(r, members)) for r in trs]
     parts = []
     for p in db.execute(
         "SELECT * FROM participants WHERE training_id=? ORDER BY num", (training_id,)
@@ -435,11 +503,19 @@ def build_training_payload(training_id: int) -> dict:
             "join": dt(p["join_ts"]), "leave": dt(p["leave_ts"]),
             "minutes": mins, "points": calc_points(mins), "auto_leave": bool(p["auto_leave"]),
         })
+    ids = [r["vk_id"] for r, _, _, _ in views if r["vk_id"]] or [t["leader_id"]]
+    names = [n for _, n, _, _ in views] or [user_name(t["leader_id"])]
+    cws = [c for _, _, c, _ in views if c != ""]
+    if len(views) <= 1:
+        leader_id, leader_name, leader_cw = ids[0], names[0], (cws[0] if cws else "")
+    else:
+        leader_id, leader_name = ", ".join(map(str, ids)), ", ".join(names)
+        leader_cw = ", ".join(map(str, cws))
     return {
         "key": f"{t['peer_id']}-{t['start_ts']}",
         "start": dt(t["start_ts"]), "end": dt(t["end_ts"]),
         "chat_id": t["peer_id"] - 2_000_000_000, "chat_title": chat_title(t["peer_id"]),
-        "leader_id": t["leader_id"], "leader_name": lead_name, "leader_cw_id": lead_cw,
+        "leader_id": leader_id, "leader_name": leader_name, "leader_cw_id": leader_cw,
         "participants": parts,
     }
 
@@ -475,20 +551,28 @@ REPORT_HELP = (
     "- Лихушек\n\n"
     "Если имя участника записано неверно, исправь его:\n\n"
     "1 имя Лихушек\n\n"
+    "Тренеры правятся так же, но со словом «тренер»:\n\n"
+    "тренер 1 15:00-16:30\n"
+    "+ тренер Имя на варе 15:00-16:30\n"
+    "- тренер 2\n\n"
     "Когда всё будет верно, нажми «Подтвердить»."
 )
 
 
-def render_report(tid: int) -> str:
+def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
+    """
+    note — пояснение, почему отчёт пришёл именно этому получателю;
+    confirmed_by — ссылка на того, кто подтвердил запись (дописывается вверху).
+    """
     t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
-    s, e = dt(t["start_ts"]), dt(t["end_ts"])
+    ensure_trainers(t)
     parts = db.execute(
         "SELECT * FROM participants WHERE training_id=? ORDER BY num", (tid,)
     ).fetchall()
 
     members = get_members()
-    lead_name, _, lead_found = trainer_info(members, t["leader_id"])
     unmatched = []
+    trainer_warn = [False]
 
     def line(p):
         m = minutes_of(p)
@@ -508,11 +592,32 @@ def render_report(tid: int) -> str:
     stayed = [line(p) for p in parts if p["leave_ts"] >= t["end_ts"]]
     early = [line(p) for p in parts if p["leave_ts"] < t["end_ts"]]
 
-    out = [
+    trs = trainer_rows(tid)
+    views = [(r, *trainer_view(r, members)) for r in trs]
+    if members and any(not found for _, _, _, found in views):
+        trainer_warn[0] = True
+    if len(trs) == 1 and trs[0]["join_ts"] <= t["start_ts"] and (trs[0]["leave_ts"] or 0) >= t["end_ts"]:
+        r, name, _, _ = views[0]
+        trainer_lines = [f"Вёл тренировку: {trainer_link(r, name)}"]
+    else:
+        trainer_lines = ["Тренеры:"]
+        for r, name, _, found in views:
+            warn = " ⚠" if members and not found else ""
+            trainer_lines.append(
+                f"{r['num']}. {trainer_link(r, name)}{warn} {fmt_t(r['join_ts'], t['start_ts'])} - "
+                f"{fmt_t(r['leave_ts'] or t['end_ts'], t['start_ts'])}"
+            )
+
+    out = []
+    if confirmed_by:
+        out += [f"✔ Запись подтвердил(а): {confirmed_by}", ""]
+    if note:
+        out += [f"ℹ {note}", ""]
+    out += [
         head,
         f"Беседа: {chat_title(t['peer_id'])}",
         "",
-        f"Вёл тренировку: [id{t['leader_id']}|{lead_name}]",
+        *trainer_lines,
         "",
         "Участники:",
         *(stayed or ["—"]),
@@ -523,11 +628,12 @@ def render_report(tid: int) -> str:
     if unmatched:
         notes.append("⚠ — персонаж не найден на листе «Участники», CW ID не будет записан. "
                      "Если имя написано с ошибкой, исправь его: «N имя Верное Имя».")
-    if members and not lead_found:
+    if trainer_warn[0]:
         notes.append("⚠ Тренер не найден на листе «Участники» по VK ID — CW ID тренера останется пустым.")
     if notes:
         out += ["", *notes]
-    out += ["", REPORT_HELP]
+    if not confirmed_by:
+        out += ["", REPORT_HELP]
     return "\n".join(out)
 
 
@@ -539,35 +645,84 @@ def confirm_kb(tid: int) -> str:
     return kb.get_keyboard()
 
 
-def send_new_report(tid: int, user_ids):
-    text, kb = render_report(tid), confirm_kb(tid)
-    for uid in user_ids:
-        if not uid:
-            continue
-        try:
-            r = vk.messages.send(
-                peer_ids=uid,
-                random_id=random.getrandbits(31),
-                message=text,
-                keyboard=kb,
-                disable_mentions=1,
-            )
-        except ApiError as e:
-            log.warning("Не удалось отправить отчёт %s: %s", uid, e)
-            continue
-        item = r[0] if r else {}
-        if item.get("error"):
-            log.warning("Отчёт для %s не доставлен: %s (нужно разрешить сообщения от сообщества)",
-                        uid, item["error"])
-            continue
-        db.execute(
-            "INSERT INTO reports(training_id,user_id,message_id,cmid,sent_ts) VALUES(?,?,?,?,?)",
-            (tid, uid, item.get("message_id"), item.get("conversation_message_id"), int(time.time())),
+def send_report_message(tid: int, uid: int, note: str = None) -> bool:
+    """Отправляет отчёт одному получателю. False — доставить нельзя (запретил сообщения, не писал и т.п.)."""
+    try:
+        r = vk.messages.send(
+            peer_ids=uid,
+            random_id=random.getrandbits(31),
+            message=render_report(tid, note=note),
+            keyboard=confirm_kb(tid),
+            disable_mentions=1,
         )
-        db.commit()
-        return uid
-    log.error("Отчёт по тренировке %s никому не отправлен", tid)
-    return None
+    except ApiError as e:
+        log.warning("Не удалось отправить отчёт %s: %s", uid, e)
+        return False
+    item = r[0] if r else {}
+    if item.get("error"):
+        log.warning("Отчёт для %s не доставлен: %s (нужно разрешить сообщения от сообщества)",
+                    uid, item["error"])
+        return False
+    db.execute(
+        "INSERT INTO reports(training_id,user_id,message_id,cmid,sent_ts,note) VALUES(?,?,?,?,?,?)",
+        (tid, uid, item.get("message_id"), item.get("conversation_message_id"), int(time.time()), note),
+    )
+    db.commit()
+    return True
+
+
+def deliver_report(tid: int, uids, note: str = None):
+    """Рассылает отчёт всем из списка (без повторов). Возвращает тех, кому доставлено."""
+    done = []
+    for uid in dict.fromkeys(u for u in uids if u and u > 0):
+        if send_report_message(tid, uid, note):
+            done.append(uid)
+    return done
+
+
+def dispatch_report(tid: int):
+    """
+    Кому отправить отчёт после /стоп:
+      • обычно — всем участвовавшим тренерам;
+      • в день самоуправления, если тренировку провёл(и) не администратор(ы) беседы — администраторам сообщества;
+      • если тренерам доставить нельзя — резервно администраторам сообщества (подтвердить может любой из них).
+    """
+    t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
+    ensure_trainers(t)
+    chat = get_chat(t["peer_id"])
+    trainers = [r["vk_id"] for r in trainer_rows(tid) if r["vk_id"] and r["vk_id"] > 0]
+    stopper = [t["stopper_id"]] if t["stopper_id"] else []
+    admins = sorted(group_admin_ids())
+
+    self_gov_no_admin = bool(chat) and is_self_gov_day(chat, t["start_ts"]) and not any(
+        is_chat_admin(t["peer_id"], u) for u in trainers)
+    if self_gov_no_admin:
+        note = ("Отчёт отправлен вам как администратору сообщества: в день самоуправления "
+                "тренировку провёл(и) не администратор беседы.")
+        if deliver_report(tid, admins, note):
+            return
+        log.warning("Тренировка %s: администраторам сообщества отчёт доставить не удалось — пробую тренерам", tid)
+        if deliver_report(tid, trainers + stopper):
+            return
+    else:
+        if deliver_report(tid, trainers):
+            return
+        if deliver_report(tid, [u for u in stopper if u not in trainers]):
+            return
+        who_txt = ", ".join(user_link(u) for u in trainers) or "тренеру"
+        note = f"Отчёт отправлен вам как администратору сообщества: не удалось доставить его тренеру ({who_txt})."
+        if deliver_report(tid, [a for a in admins if a not in trainers], note):
+            return
+    log.error("Отчёт по тренировке %s не удалось доставить никому", tid)
+
+
+def latest_reports(tid: int):
+    """Последнее отправленное сообщение с отчётом для каждого получателя."""
+    return db.execute(
+        "SELECT * FROM reports WHERE training_id=? AND id IN "
+        "(SELECT MAX(id) FROM reports WHERE training_id=? GROUP BY user_id) ORDER BY id",
+        (tid, tid),
+    ).fetchall()
 
 
 def update_report(rep):
@@ -577,14 +732,20 @@ def update_report(rep):
             vk.messages.edit(
                 peer_id=uid,
                 conversation_message_id=rep["cmid"],
-                message=render_report(tid),
+                message=render_report(tid, note=rep["note"]),
                 keyboard=confirm_kb(tid),
                 disable_mentions=1,
             )
             return
         except ApiError as e:
             log.info("Редактирование недоступно (%s) — шлю новое сообщение", e)
-    send_new_report(tid, [uid])  # новое сообщение становится «исходным»
+    send_report_message(tid, uid, rep["note"])  # новое сообщение становится «исходным»
+
+
+def update_all_reports(tid: int):
+    """После правок отчёта обновляет сообщения у ВСЕХ получателей (тренеров / администраторов)."""
+    for rep in latest_reports(tid):
+        update_report(rep)
 
 
 # ───────────────────────── обработка бесед ─────────────────────────
@@ -596,6 +757,12 @@ RE_START = re.compile(r"(?<![\w/])/старт(?!\w)" + CLOCK, re.I)
 RE_STOP = re.compile(r"(?<![\w/])/стоп(?!\w)" + CLOCK, re.I)
 RE_JOIN = re.compile(r"^#лапа\s+(.+)$", re.I | re.S)
 RE_LEAVE = re.compile(r"^#уход\s+(.+)$", re.I | re.S)
+RE_LEAVE_BARE = re.compile(r"^#уход\s*$", re.I)       # «#уход» без имени — уходит тренер
+RE_ADD_TRAINER = re.compile(r"^\+\s*тренер(?!\w)", re.I)  # «+ тренер» — стать тренером активной тренировки
+
+RETRO_STOP_WINDOW_SEC = 2 * 3600   # правка «/старт»: если за 2 часа после него есть «/стоп» — не стартуем
+EDIT_WATCH_SEC = 6 * 3600          # сколько часов следить за нераспознанными командами (опрос правок)
+MSG_LOG_KEEP_SEC = 3 * 86400       # сколько хранить журнал команд (нужен для задним числом «/старт»)
 
 
 def active_training(peer_id: int):
@@ -608,6 +775,52 @@ def active_training(peer_id: int):
 def next_num(tid: int) -> int:
     r = db.execute("SELECT COALESCE(MAX(num),0)+1 AS n FROM participants WHERE training_id=?", (tid,))
     return r.fetchone()["n"]
+
+
+def next_trainer_num(tid: int) -> int:
+    r = db.execute("SELECT COALESCE(MAX(num),0)+1 AS n FROM trainers WHERE training_id=?", (tid,))
+    return r.fetchone()["n"]
+
+
+def create_training(peer: int, uid: int, start_ts: int, cmid):
+    """Новая тренировка; написавший /старт становится первым тренером."""
+    cur = db.execute(
+        "INSERT INTO trainings(peer_id,leader_id,start_ts,start_cmid) VALUES(?,?,?,?)",
+        (peer, uid, start_ts, cmid),
+    )
+    db.execute(
+        "INSERT INTO trainers(training_id,num,vk_id,join_ts,join_cmid) VALUES(?,?,?,?,?)",
+        (cur.lastrowid, 1, uid, start_ts, cmid),
+    )
+    db.commit()
+    return db.execute("SELECT * FROM trainings WHERE id=?", (cur.lastrowid,)).fetchone()
+
+
+def active_trainer(tid: int, uid: int):
+    return db.execute(
+        "SELECT * FROM trainers WHERE training_id=? AND vk_id=? AND leave_ts IS NULL ORDER BY id LIMIT 1",
+        (tid, uid),
+    ).fetchone()
+
+
+# ── дни самоуправления и права на проведение тренировок
+DAY_NAMES = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def self_gov_set(chat) -> set:
+    return {int(x) for x in (chat["self_gov_days"] or "").split(",") if x.strip().isdigit()}
+
+
+def is_self_gov_day(chat, ts: int) -> bool:
+    """В день самоуправления вести тренировки может любой участник беседы."""
+    return dt(ts).weekday() in self_gov_set(chat)
+
+
+def can_train(chat, peer: int, uid: int, ts: int) -> bool:
+    """Может ли uid начинать/вести тренировку (ts — время тренировки, нужно для дня самоуправления)."""
+    if not chat["admins_only"] or is_self_gov_day(chat, ts):
+        return True
+    return is_chat_admin(peer, uid)
 
 
 def process_join(peer: int, tr, uid: int, cmid, name: str, ts: int):
@@ -639,90 +852,189 @@ def process_join(peer: int, tr, uid: int, cmid, name: str, ts: int):
     react(peer, cmid, "eye")
 
 
-def handle_chat_edit(msg: dict, source: str = "событие") -> bool:
-    """
-    Отредактированное сообщение в беседе: если после правки это корректное «#лапа Имя» и тренировка
-    сейчас идёт (начата и не закончена) — участник добавляется. Время прихода — время исходного
-    сообщения (но не раньше старта тренировки). True — участник добавлен/обновлён.
-    source — откуда узнали о правке: «событие» (message_edit) или «опрос».
-    """
-    peer, uid, cmid = msg.get("peer_id", 0), msg.get("from_id", 0), msg.get("conversation_message_id")
-    text = MENTION_RE.sub("", msg.get("text") or "").strip()
-    tag = f"правка {source}: беседа {peer}, сообщение {cmid}, текст {text[:60]!r}"
-    if msg.get("action") or uid <= 0 or not cmid:
-        log.info("%s — пропущена (служебное сообщение или нет ID)", tag)
-        return False
-    m = RE_JOIN.match(text)
-    if not m:
-        log.info("%s — пропущена: это не «#лапа Имя»", tag)
-        return False
-    register_chat(peer)
-    chat = get_chat(peer)
-    if not chat or not chat["enabled"]:
-        log.info("%s — пропущена: беседа отключена в /настройка", tag)
-        return False
-    tr = active_training(peer)
-    if not tr:
-        log.info("%s — пропущена: тренировка не идёт (не начата или уже закончена)", tag)
-        return False
-    if tr["start_cmid"] and cmid < tr["start_cmid"]:
-        log.info("%s — пропущена: сообщение отправлено до /старт текущей тренировки", tag)
-        return False
-    name = norm_name(m.group(1))
-    if not name:
-        log.info("%s — пропущена: пустое имя", tag)
-        return False
-    process_join(peer, tr, uid, cmid, name, floor_min(msg.get("date") or int(time.time())))
-    log.info("%s — участник «%s» обработан", tag, name)
-    return True
+def classify(text: str):
+    """Какая команда в тексте: start / join / leave / add_trainer / stop (порядок важен) или None."""
+    if RE_START.search(text):
+        return "start"
+    if RE_JOIN.match(text):
+        return "join"
+    if RE_LEAVE.match(text) or RE_LEAVE_BARE.match(text):
+        return "leave"
+    if RE_ADD_TRAINER.match(text):
+        return "add_trainer"
+    if RE_STOP.search(text):
+        return "stop"
+    return None
 
 
-def watch_message(peer: int, uid: int, cmid, date: int, text: str):
-    """Запоминает непонятное «#…»-сообщение: если его потом исправят, опрос это заметит."""
-    if EDIT_POLL_SEC <= 0 or not cmid:
-        return
+def process_member_command(peer: int, chat, tr, uid: int, cmid, text: str, ts: int, kind: str) -> bool:
+    """#лапа, #уход, «+ тренер» в активной тренировке. True — команда дала эффект (или осознанно проигнорирована)."""
+    ensure_trainers(tr)
+    if kind == "join":
+        name = norm_name(RE_JOIN.match(text).group(1))
+        if not name:
+            return False
+        process_join(peer, tr, uid, cmid, name, ts)
+        return True
+
+    if kind == "leave":
+        m = RE_LEAVE.match(text)
+        name = norm_name(m.group(1)) if m else ""
+        p = None
+        if name:
+            base = "SELECT * FROM participants WHERE training_id=? AND leave_ts IS NULL "
+            p = db.execute(base + "AND vk_id=? AND name=? ORDER BY id LIMIT 1", (tr["id"], uid, name)).fetchone()
+            if not p:  # ушёл другой человек, а написал, например, ведущий
+                p = db.execute(base + "AND name=? ORDER BY id LIMIT 1", (tr["id"], name)).fetchone()
+            if not p:  # имя написано иначе, но у отправителя ровно одна активная запись
+                rows = db.execute(base + "AND vk_id=?", (tr["id"], uid)).fetchall()
+                p = rows[0] if len(rows) == 1 else None
+        if p:
+            db.execute(
+                "UPDATE participants SET leave_ts=?, leave_cmid=? WHERE id=?",
+                (max(ts, p["join_ts"]), cmid, p["id"]),
+            )
+            db.commit()
+            react(peer, cmid, "check")
+            react(peer, p["join_cmid"], "check")  # 👁 → ✔ на сообщении #лапа
+            return True
+        trn = active_trainer(tr["id"], uid)  # «#уход» тренера: покидает тренировку как тренер
+        if trn:
+            db.execute("UPDATE trainers SET leave_ts=?, leave_cmid=? WHERE id=?",
+                       (max(ts, trn["join_ts"]), cmid, trn["id"]))
+            db.commit()
+            react(peer, cmid, "check")
+            return True
+        return False
+
+    if kind == "add_trainer":
+        if not can_train(chat, peer, uid, tr["start_ts"]):
+            return True  # по правилам беседы стать тренером нельзя
+        if active_trainer(tr["id"], uid):
+            return True
+        if cmid and db.execute("SELECT 1 FROM trainers WHERE training_id=? AND join_cmid=?",
+                               (tr["id"], cmid)).fetchone():
+            return True  # это сообщение уже добавило тренера (повторное событие)
+        db.execute(
+            "INSERT INTO trainers(training_id,num,vk_id,join_ts,join_cmid) VALUES(?,?,?,?,?)",
+            (tr["id"], next_trainer_num(tr["id"]), uid, max(ts, tr["start_ts"]), cmid),
+        )
+        db.commit()
+        react(peer, cmid, "up")
+        return True
+    return False
+
+
+def stop_training(peer: int, chat, tr, uid: int, cmid, text: str, ts: int):
+    """/стоп [время]: заканчивает тренировку и рассылает отчёт."""
+    ensure_trainers(tr)
+    if not (can_train(chat, peer, uid, tr["start_ts"]) or active_trainer(tr["id"], uid)):
+        return  # завершить может тот, кто вправе вести тренировки, или тренер этой тренировки
+    mst = RE_STOP.search(text)
+    end = ts
+    if mst.group(1):  # «/стоп 12:00» — конец тренировки в 12:00, даже если команда пришла позже
+        end = resolve_clock(ts, mst.group(1), mst.group(2), not_before=tr["start_ts"]) or ts
+    end = max(end, tr["start_ts"])
+    # всё, что было «после конца» (вход/уход, записанные до получения /стоп), подтягиваем к концу
+    for table in ("participants", "trainers"):
+        db.execute(f"UPDATE {table} SET join_ts=? WHERE training_id=? AND join_ts>?", (end, tr["id"], end))
+        db.execute(f"UPDATE {table} SET leave_ts=? WHERE training_id=? AND leave_ts>?", (end, tr["id"], end))
+    # кто не ушёл сам — уходит в момент окончания тренировки
     db.execute(
-        "INSERT OR IGNORE INTO watched_msgs(peer_id,cmid,from_id,msg_date,text,added_ts) VALUES(?,?,?,?,?,?)",
-        (peer, cmid, uid, date, text, int(time.time())),
+        "UPDATE participants SET leave_ts=?, auto_leave=1 WHERE training_id=? AND leave_ts IS NULL",
+        (end, tr["id"]),
+    )
+    db.execute("UPDATE trainers SET leave_ts=? WHERE training_id=? AND leave_ts IS NULL", (end, tr["id"]))
+    db.execute(
+        "UPDATE trainings SET status='finished', end_ts=?, stopper_id=? WHERE id=?",
+        (end, uid, tr["id"]),
     )
     db.commit()
+    chat_title(peer, refresh=True)  # актуальное название на момент отчёта
+    autocorrect_participants(tr["id"])
+    dispatch_report(tr["id"])
 
 
-def poll_watched_messages():
+def replay_log(peer: int, chat, tr):
     """
-    Запасной способ ловить правки, не зависящий от доставки события message_edit: раз в
-    EDIT_POLL_SEC секунд перечитывает запомненные сообщения и, если текст изменился, обрабатывает их.
+    Тренировка начата «задним числом» (исправленным /старт): применяем #лапа, #уход и «+ тренер»,
+    написанные после этого сообщения, со временем их отправки.
     """
-    db.execute("DELETE FROM watched_msgs WHERE added_ts<?", (int(time.time()) - EDIT_LIMIT_SEC,))
-    for peer in [r["peer_id"] for r in db.execute("SELECT DISTINCT peer_id FROM watched_msgs")]:
-        tr = active_training(peer)
-        if not tr:  # тренировки нет — следить не за чем
-            db.execute("DELETE FROM watched_msgs WHERE peer_id=?", (peer,))
-            continue
-        # сообщения, отправленные до /старт нынешней тренировки (остатки прошлой), не считаются
-        db.execute("DELETE FROM watched_msgs WHERE peer_id=? AND cmid<?", (peer, tr["start_cmid"] or 0))
-        rows = db.execute("SELECT * FROM watched_msgs WHERE peer_id=?", (peer,)).fetchall()
-        for i in range(0, len(rows), 100):
-            chunk = rows[i:i + 100]
-            try:
-                r = vk.messages.getByConversationMessageId(
-                    peer_id=peer, conversation_message_ids=",".join(str(w["cmid"]) for w in chunk))
-            except ApiError as e:
-                log.warning("Опрос правок: не удалось прочитать сообщения беседы %s: %s", peer, e)
+    rows = db.execute("SELECT * FROM msg_log WHERE peer_id=? AND cmid>? ORDER BY cmid",
+                      (peer, tr["start_cmid"] or 0)).fetchall()
+    for r in rows:
+        text = MENTION_RE.sub("", r["text"] or "").strip()
+        kind = classify(text)
+        if kind in ("join", "leave", "add_trainer") and r["from_id"] and r["from_id"] > 0:
+            cur = active_training(peer)
+            if not cur or cur["id"] != tr["id"]:
                 break
-            items = {it.get("conversation_message_id"): it for it in r.get("items", [])}
-            for w in chunk:
-                it = items.get(w["cmid"])
-                if not it:
-                    continue  # сообщение удалено
-                new = it.get("text") or ""
-                if new == w["text"]:
-                    continue
-                db.execute("UPDATE watched_msgs SET text=? WHERE peer_id=? AND cmid=?", (new, peer, w["cmid"]))
-                db.commit()
-                it = dict(it, peer_id=peer)
-                if handle_chat_edit(it, source="опрос"):
-                    db.execute("DELETE FROM watched_msgs WHERE peer_id=? AND cmid=?", (peer, w["cmid"]))
+            process_member_command(peer, chat, cur, r["from_id"], r["cmid"], text,
+                                   floor_min(r["date"] or int(time.time())), kind)
+
+
+def process_chat_command(peer: int, chat, uid: int, cmid, text: str, ts: int, edited: bool = False) -> bool:
+    """
+    Разбор команды из сообщения беседы (новое или отредактированное). ts — время отправки сообщения.
+    True — команда распознана и отработана (или осознанно проигнорирована); False — эффекта не было
+    (такое сообщение бот перечитывает: вдруг его исправят).
+    """
+    kind = classify(text)
+    if kind is None:
+        return False
+    tr = active_training(peer)
+
+    if kind == "start":
+        if tr:
+            return True
+        ms = RE_START.search(text)
+        # «/старт 10:00» — тренировка считается начатой в 10:00, даже если команда отправлена раньше/позже
+        start_ts = (resolve_clock(ts, ms.group(1), ms.group(2)) if ms.group(1) else None) or ts
+        if not can_train(chat, peer, uid, start_ts):
+            return True  # в беседе тренировки ведут только администраторы
+        if edited:
+            # исправили сообщение: стартуем задним числом, только если в ближайшие 2 часа нет «/стоп»
+            for r in db.execute("SELECT text FROM msg_log WHERE peer_id=? AND cmid>? AND date>=? AND date<=?",
+                                (peer, cmid or 0, ts, ts + RETRO_STOP_WINDOW_SEC)):
+                if RE_STOP.search(MENTION_RE.sub("", r["text"] or "").strip()):
+                    log.info("Правка /старт (беседа %s, сообщение %s): в ближайшие 2 часа есть /стоп — "
+                             "тренировку не начинаю", peer, cmid)
+                    return True
+        new = create_training(peer, uid, start_ts, cmid)
+        react(peer, cmid, "up")
+        if edited:
+            log.info("Тренировка начата задним числом по исправленному /старт (беседа %s, сообщение %s)", peer, cmid)
+            replay_log(peer, chat, new)
+        return True
+
+    if not tr:
+        return kind == "stop"  # /стоп без тренировки — нечего заканчивать; остальные команды ничего не дали
+    if edited and tr["start_cmid"] and cmid and cmid < tr["start_cmid"]:
+        log.info("Команда из сообщения %s отправлена до /старт текущей тренировки — пропущена", cmid)
+        return True
+    if kind == "stop":
+        stop_training(peer, chat, tr, uid, cmid, text, ts)
+        return True
+    return process_member_command(peer, chat, tr, uid, cmid, text, ts, kind)
+
+
+def is_command_like(text: str) -> bool:
+    return "/" in text or "#" in text or text.startswith("+")
+
+
+def worth_watching(text: str) -> bool:
+    """Стоит ли перечитывать нераспознанное сообщение: похоже на неудавшуюся команду."""
+    return text.startswith(("#", "/")) or bool(re.match(r"\+\s*т", text, re.I))
+
+
+def log_message(peer: int, uid: int, cmid, date: int, text: str, recognized: bool):
+    if not cmid:
+        return
+    db.execute(
+        "INSERT INTO msg_log(peer_id,cmid,from_id,date,text,recognized,added_ts) VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(peer_id,cmid) DO UPDATE SET text=excluded.text, recognized=excluded.recognized",
+        (peer, cmid, uid, date, text, 1 if recognized or not worth_watching(text) else 0, int(time.time())),
+    )
     db.commit()
 
 
@@ -734,98 +1046,83 @@ def handle_chat(msg: dict):
         return
     register_chat(peer)
     text = MENTION_RE.sub("", msg.get("text") or "").strip()
-    if not text or ("/" not in text and "#" not in text):
+    if not text or not is_command_like(text):
         return
     chat = get_chat(peer)
     if not chat or not chat["enabled"]:
         return  # беседа отключена в /настройка — бот её игнорирует
     # TODO (свободный бег): if chat["free_run"]: ... — доработаем позже
-    ts = floor_min(msg["date"])
     ensure_admin(peer)
-    tr = active_training(peer)
+    effect = process_chat_command(peer, chat, uid, cmid, text, floor_min(msg["date"]), edited=False)
+    log_message(peer, uid, cmid, msg["date"], text, effect)
 
-    # /старт
-    ms = RE_START.search(text)
-    if ms:
-        if tr:
-            return
-        if chat["admins_only"] and not is_chat_admin(peer, uid):
-            return  # в беседе тренировки ведут только администраторы
-        # «/старт 10:00» — тренировка считается начатой в 10:00, даже если команда отправлена раньше/позже
-        start_ts = (resolve_clock(ts, ms.group(1), ms.group(2)) if ms.group(1) else None) or ts
-        db.execute(
-            "INSERT INTO trainings(peer_id,leader_id,start_ts,start_cmid) VALUES(?,?,?,?)",
-            (peer, uid, start_ts, cmid),
-        )
-        db.commit()
-        react(peer, cmid, "up")
-        return
 
-    if not tr:
-        return  # вне тренировки команды игнорируются
+def handle_chat_edit(msg: dict, source: str = "событие") -> bool:
+    """
+    Отредактированное сообщение в беседе (событие message_edit или запасной опрос). Если после правки
+    в нём команда (/старт, /стоп, #лапа, #уход, «+ тренер»), она отрабатывается так, как если бы была
+    отправлена в исходное время сообщения (правила — в process_chat_command). True — эффект был.
+    """
+    peer, uid, cmid = msg.get("peer_id", 0), msg.get("from_id", 0), msg.get("conversation_message_id")
+    text = MENTION_RE.sub("", msg.get("text") or "").strip()
+    tag = f"правка {source}: беседа {peer}, сообщение {cmid}, текст {text[:60]!r}"
+    if msg.get("action") or uid <= 0 or not cmid:
+        log.info("%s — пропущена (служебное сообщение или нет ID)", tag)
+        return False
+    date = msg.get("date") or int(time.time())
+    row = db.execute("SELECT * FROM msg_log WHERE peer_id=? AND cmid=?", (peer, cmid)).fetchone()
+    if row and row["text"] == text and row["recognized"]:
+        log.info("%s — пропущена: этот текст уже обработан", tag)
+        return False
+    if not text or not is_command_like(text):
+        log_message(peer, uid, cmid, date, text, True)  # перестало быть командой — следить больше не нужно
+        log.info("%s — пропущена: в сообщении нет команды", tag)
+        return False
+    register_chat(peer)
+    chat = get_chat(peer)
+    if not chat or not chat["enabled"]:
+        log.info("%s — пропущена: беседа отключена в /настройка", tag)
+        return False
+    effect = process_chat_command(peer, chat, uid, cmid, text, floor_min(date), edited=True)
+    log_message(peer, uid, cmid, date, text, effect)
+    log.info("%s — %s", tag, "команда отработана" if effect else "команды нет или она ничего не дала")
+    return effect
 
-    # #лапа Имя (кличка)
-    m = RE_JOIN.match(text)
-    if m:
-        name = norm_name(m.group(1))
-        if not name:
-            return
-        process_join(peer, tr, uid, cmid, name, ts)
-        return
 
-    # #уход Имя
-    m = RE_LEAVE.match(text)
-    if m:
-        name = norm_name(m.group(1))
-        if not name:
-            return
-        base = "SELECT * FROM participants WHERE training_id=? AND leave_ts IS NULL "
-        p = db.execute(base + "AND vk_id=? AND name=? ORDER BY id LIMIT 1", (tr["id"], uid, name)).fetchone()
-        if not p:  # ушёл другой человек, а написал, например, ведущий
-            p = db.execute(base + "AND name=? ORDER BY id LIMIT 1", (tr["id"], name)).fetchone()
-        if not p:  # имя написано иначе, но у отправителя ровно одна активная запись
-            rows = db.execute(base + "AND vk_id=?", (tr["id"], uid)).fetchall()
-            p = rows[0] if len(rows) == 1 else None
-        if not p:
-            return
-        db.execute(
-            "UPDATE participants SET leave_ts=?, leave_cmid=? WHERE id=?", (max(ts, p["join_ts"]), cmid, p["id"])
-        )
-        db.commit()
-        react(peer, cmid, "check")
-        react(peer, p["join_cmid"], "check")  # 👁 → ✔ на сообщении #лапа
-        return
-
-    # /стоп
-    mst = RE_STOP.search(text)
-    if mst:
-        if chat["admins_only"] and not is_chat_admin(peer, uid):
-            return
-        end = ts
-        if mst.group(1):  # «/стоп 12:00» — конец тренировки в 12:00, даже если команда пришла позже
-            end = resolve_clock(ts, mst.group(1), mst.group(2), not_before=tr["start_ts"]) or ts
-        end = max(end, tr["start_ts"])
-        # всё, что было «после конца» (вход/уход, записанные до получения /стоп), подтягиваем к концу
-        db.execute("UPDATE participants SET join_ts=? WHERE training_id=? AND join_ts>?", (end, tr["id"], end))
-        db.execute("UPDATE participants SET leave_ts=? WHERE training_id=? AND leave_ts>?", (end, tr["id"], end))
-        # кто не ушёл сам — уходит в момент окончания тренировки
-        db.execute(
-            "UPDATE participants SET leave_ts=?, auto_leave=1 WHERE training_id=? AND leave_ts IS NULL",
-            (end, tr["id"]),
-        )
-        db.execute(
-            "UPDATE trainings SET status='finished', end_ts=?, stopper_id=? WHERE id=?",
-            (end, uid, tr["id"]),
-        )
-        db.commit()
-        chat_title(peer, refresh=True)  # актуальное название на момент отчёта
-        autocorrect_participants(tr["id"])
-        send_new_report(tr["id"], [tr["leader_id"], uid])
-        return
-
-    # «#…» во время тренировки, но команда не распознана (опечатка?) — присмотримся: вдруг исправят
-    if text.startswith("#"):
-        watch_message(peer, uid, cmid, msg["date"], text)
+def poll_watched_messages():
+    """
+    Запасной способ ловить правки, не зависящий от доставки события message_edit: раз в EDIT_POLL_SEC
+    секунд перечитывает недавние сообщения, где команда не сработала, и, если текст изменился,
+    обрабатывает их как правку.
+    """
+    now = int(time.time())
+    db.execute("DELETE FROM msg_log WHERE added_ts<?", (now - MSG_LOG_KEEP_SEC,))
+    rows = db.execute("SELECT * FROM msg_log WHERE recognized=0 AND added_ts>? ORDER BY peer_id, cmid",
+                      (now - EDIT_WATCH_SEC,)).fetchall()
+    by_peer = {}
+    for r in rows:
+        by_peer.setdefault(r["peer_id"], []).append(r)
+    for peer, items_ in by_peer.items():
+        for i in range(0, len(items_), 100):
+            chunk = items_[i:i + 100]
+            try:
+                resp = vk.messages.getByConversationMessageId(
+                    peer_id=peer, conversation_message_ids=",".join(str(w["cmid"]) for w in chunk))
+            except ApiError as e:
+                log.warning("Опрос правок: не удалось прочитать сообщения беседы %s: %s", peer, e)
+                break
+            found = {it.get("conversation_message_id"): it for it in resp.get("items", [])}
+            for w in chunk:
+                it = found.get(w["cmid"])
+                if not it:
+                    continue  # сообщение удалено
+                new = MENTION_RE.sub("", it.get("text") or "").strip()
+                if new == w["text"]:
+                    continue
+                db.execute("UPDATE msg_log SET text=? WHERE peer_id=? AND cmid=?", (new, peer, w["cmid"]))
+                db.commit()
+                handle_chat_edit(dict(it, peer_id=peer), source="опрос")
+    db.commit()
 
 
 # ───────────────────────── правки в ЛС ─────────────────────────
@@ -837,6 +1134,10 @@ TIME = r"(\d{1,2})[:.](\d{2})"
 RE_RENAME = re.compile(r"^\[?(\d+)\]?\s+имя\s+(.+)$", re.I)
 RE_FIX = re.compile(rf"^\[?(\d+)\]?\s+{TIME}\s*[-–—]\s*{TIME}$")
 RE_PM = re.compile(rf"^([+\-])\s*(.+?)(?:\s+{TIME}\s*[-–—]\s*{TIME})?$")
+# строки про тренеров: «тренер 1 15:00-16:30», «+ тренер Имя 15:00-16:30», «- тренер 2»
+RE_T_FIX = re.compile(rf"^тренер\s+\[?(\d+)\]?\s+{TIME}\s*[-–—]\s*{TIME}$", re.I)
+RE_T_PM = re.compile(rf"^([+\-])\s*тренер\s+(.+?)(?:\s+{TIME}\s*[-–—]\s*{TIME})?$", re.I)
+RE_VK_REF = re.compile(r"^(?:https?://)?(?:m\.)?(?:vk\.(?:com|ru)/)?id(\d+)/?$", re.I)
 
 
 def _candidates(base_ts: int, h, m):
@@ -862,10 +1163,60 @@ def _span(t, h1, m1, h2, m2):
     return j, l
 
 
+def resolve_trainer_ref(arg: str, members):
+    """«id123», ссылка на страницу или имя на варе → (VK ID | None, имя | None)."""
+    m = RE_VK_REF.match(arg.strip())
+    if m:
+        return int(m.group(1)), None
+    name = norm_name(arg)
+    if not name:
+        raise EditError("пустое имя тренера")
+    rec = members.participant(name) if members else None
+    if rec:
+        return rec["vk_id"], rec["name"] or name
+    return None, name
+
+
 def apply_edits(tid: int, lines):
     t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
+    ensure_trainers(t)
+    members = get_members()  # до транзакции: может обращаться к Google Таблице
     with db:  # атомарно: при ошибке откат всех строк
         for ln in lines:
+            m = RE_T_FIX.match(ln)
+            if m:
+                j, l = _span(t, *m.groups()[1:])
+                cur = db.execute("UPDATE trainers SET join_ts=?, leave_ts=? WHERE training_id=? AND num=?",
+                                 (j, l, tid, int(m.group(1))))
+                if cur.rowcount == 0:
+                    raise EditError(f"нет тренера {m.group(1)}")
+                continue
+            m = RE_T_PM.match(ln)
+            if m:
+                sign, arg, times = m.group(1), m.group(2).strip(), m.groups()[2:]
+                if sign == "+":
+                    vk_id, name = resolve_trainer_ref(arg, members)
+                    j, l = _span(t, *times) if all(times) else (t["start_ts"], t["end_ts"])
+                    db.execute(
+                        "INSERT INTO trainers(training_id,num,vk_id,name,join_ts,leave_ts) VALUES(?,?,?,?,?,?)",
+                        (tid, next_trainer_num(tid), vk_id, name, j, l),
+                    )
+                else:
+                    if arg.isdigit():
+                        removed = db.execute("DELETE FROM trainers WHERE training_id=? AND num=?",
+                                             (tid, int(arg))).rowcount
+                    else:
+                        key = name_key(arg)
+                        ids = [r["id"] for r in db.execute("SELECT * FROM trainers WHERE training_id=?", (tid,))
+                               if name_key(trainer_view(r, members)[0]) == key]
+                        for i in ids:
+                            db.execute("DELETE FROM trainers WHERE id=?", (i,))
+                        removed = len(ids)
+                    if removed == 0:
+                        raise EditError(f"не найден тренер: {arg}")
+                continue
+            if re.match(r"^[+\-]\s*тренер\s*$", ln, re.I):
+                raise EditError("после «тренер» нужно указать имя или номер")
             m = RE_RENAME.match(ln)
             if m:
                 name = norm_name(m.group(2))
@@ -947,6 +1298,7 @@ def find_report(uid: int, msg: dict):
 # ───────────────────────── /настройка (ЛС сообщества) ─────────────────────────
 CMD_SETTINGS_RE = re.compile(r"^/настройка(?!\w)", re.I)
 SETTINGS_RE = re.compile(r"^(\d+)\s+(вкл|выкл|сб\+|сб-|админы\+|админы-)$", re.I)
+SELFGOV_RE = re.compile(r"^(\d+)\s+сам(?:оуправление)?\s*(.*)$", re.I)
 SETTINGS_COLS = {
     "вкл": ("enabled", 1), "выкл": ("enabled", 0),
     "сб+": ("free_run", 1), "сб-": ("free_run", 0),
@@ -957,9 +1309,49 @@ SETTINGS_HELP = (
     "• вкл/выкл — подключить или отключить учёт баллов в беседе\n"
     "• сб+/сб- — подключить или отключить учёт свободного бега\n"
     "• админы+/админы- — подключить проведение тренировок только администраторами "
-    "или всеми участниками\n\n"
+    "или всеми участниками\n"
+    "• сам пн,ср,сб / сам- — день самоуправления: выбрать дни недели, когда тренировки может "
+    "проводить любой участник (также: будни, выходные, ежедневно), или отключить режим\n\n"
     "Например: 1 вкл"
 )
+
+DAY_ALIASES = {
+    "пн": 0, "пон": 0, "понедельник": 0, "вт": 1, "вторник": 1, "ср": 2, "среда": 2, "чт": 3,
+    "четверг": 3, "пт": 4, "пятница": 4, "сб": 5, "суббота": 5, "вс": 6, "воскресенье": 6,
+}
+DAY_GROUPS = {
+    "будни": range(0, 5), "будние": range(0, 5), "выходные": range(5, 7),
+    "ежедневно": range(7), "все": range(7), "каждый": range(7),
+}
+DAY_OFF = {"", "-", "выкл", "нет", "откл", "отключить", "отключен", "отключено", "0"}
+
+
+def parse_days(arg: str) -> str:
+    """«пн,ср», «пн-ср», «будни», «сб вс» → «0,2» (пн=0 … вс=6). Пустая строка — режим отключён."""
+    arg = arg.strip().lower()
+    if arg in DAY_OFF:
+        return ""
+    days = set()
+    for tok in re.split(r"[,;\s]+", arg):
+        if not tok:
+            continue
+        if tok in DAY_GROUPS:
+            days |= set(DAY_GROUPS[tok])
+        elif tok in DAY_ALIASES:
+            days.add(DAY_ALIASES[tok])
+        elif re.fullmatch(r"[а-яё]+-[а-яё]+", tok) and all(x in DAY_ALIASES for x in tok.split("-")):
+            a, b = (DAY_ALIASES[x] for x in tok.split("-"))
+            days |= {(a + k) % 7 for k in range((b - a) % 7 + 1)}  # «сб-пн» = сб, вс, пн
+        else:
+            raise EditError(f"не понял день недели: {tok}")
+    return ",".join(str(d) for d in sorted(days))
+
+
+def fmt_days(days: str) -> str:
+    ds = sorted(int(x) for x in (days or "").split(",") if x.strip().isdigit())
+    if not ds:
+        return "отключен"
+    return "ежедневно" if len(ds) == 7 else ", ".join(DAY_NAMES[d] for d in ds)
 
 
 def send_dm(uid: int, text: str):
@@ -989,33 +1381,45 @@ def refresh_titles():
 
 def render_settings() -> str:
     refresh_titles()
-    lines = ["Активные беседы:"]
     chats = db.execute("SELECT * FROM chats ORDER BY peer_id").fetchall()
+    blocks = []
     for c in chats:
         cid, title = c["peer_id"] - 2_000_000_000, c["title"] or "Без названия"
         if c["enabled"]:
-            lines.append(
-                f"{cid} {title} — включён. "
-                f"Свободный бег: {'включён' if c['free_run'] else 'отключен'}. "
-                f"Тренировки проводят: {'только администраторы' if c['admins_only'] else 'все участники'}"
-            )
+            blocks.append("\n".join([
+                f"{cid}. {title} — включён.",
+                f"Свободный бег: {'включён' if c['free_run'] else 'отключен'}",
+                f"Тренировки проводят: {'только администраторы' if c['admins_only'] else 'все участники'}",
+                f"День самоуправления: {fmt_days(c['self_gov_days'])}",
+            ]))
         else:
-            lines.append(f"{cid} {title} — отключен")
+            blocks.append(f"{cid}. {title} — отключен.")
     if not chats:
-        lines.append("— пока нет бесед (бот увидит беседу после первого сообщения в ней)")
-    return "\n".join(lines + ["", SETTINGS_HELP])
+        blocks.append("— пока нет бесед (бот увидит беседу после первого сообщения в ней)")
+    # беседы разделены пустой строкой, параметры одной беседы — на соседних строках
+    return "Активные беседы:\n\n" + "\n\n".join(blocks) + "\n\n" + SETTINGS_HELP
 
 
 def apply_settings(lines) -> bool:
     try:
         with db:  # атомарно: при ошибке откатываются все строки
             for ln in lines:
-                m = SETTINGS_RE.match(ln.strip())
+                ln = ln.strip()
+                m = SETTINGS_RE.match(ln)
+                if m:
+                    peer = 2_000_000_000 + int(m.group(1))
+                    if not get_chat(peer):
+                        raise EditError(f"нет беседы {m.group(1)}")
+                    col, val = SETTINGS_COLS[m.group(2).lower()]
+                    db.execute(f"UPDATE chats SET {col}=? WHERE peer_id=?", (val, peer))
+                    continue
+                m = SELFGOV_RE.match(ln)
+                if not m:
+                    raise EditError(f"не понял строку: {ln}")
                 peer = 2_000_000_000 + int(m.group(1))
                 if not get_chat(peer):
                     raise EditError(f"нет беседы {m.group(1)}")
-                col, val = SETTINGS_COLS[m.group(2).lower()]
-                db.execute(f"UPDATE chats SET {col}=? WHERE peer_id=?", (val, peer))
+                db.execute("UPDATE chats SET self_gov_days=? WHERE peer_id=?", (parse_days(m.group(2)), peer))
     except EditError as e:
         log.info("Настройка отклонена: %s", e)
         return False
@@ -1061,7 +1465,7 @@ def handle_settings(msg: dict) -> bool:
     text = (msg.get("text") or "").strip()
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     is_cmd = bool(CMD_SETTINGS_RE.match(text))
-    is_set = bool(lines) and all(SETTINGS_RE.match(l) for l in lines)
+    is_set = bool(lines) and all(SETTINGS_RE.match(l) or SELFGOV_RE.match(l) for l in lines)
     if not (is_cmd or is_set):
         return False
     if not is_group_admin(uid):
@@ -1097,7 +1501,7 @@ def handle_private(msg: dict):
         react(uid, cmid, "question")
         return
     autocorrect_participants(rep["training_id"])
-    update_report(rep)
+    update_all_reports(rep["training_id"])  # у всех тренеров / администраторов, получивших отчёт
     react(uid, cmid, "check")
 
 
@@ -1114,18 +1518,35 @@ def answer_event(event_obj: dict, text: str):
         log.warning("sendMessageEventAnswer: %s", e)
 
 
-def remove_report_keyboard(uid: int, cmid, tid: int) -> bool:
-    """Убирает кнопку «Подтвердить» из сообщения с отчётом (текст отчёта не меняется)."""
-    if not cmid:
-        row = db.execute("SELECT cmid FROM reports WHERE training_id=? AND user_id=? ORDER BY id DESC LIMIT 1",
-                         (tid, uid)).fetchone()
-        cmid = row["cmid"] if row else None
-    if not cmid:
+def report_rows(tid: int):
+    return db.execute("SELECT * FROM reports WHERE training_id=? ORDER BY id", (tid,)).fetchall()
+
+
+def reply_to_report(uid: int, cmid, text: str):
+    """Новое сообщение-ответ на сообщение с отчётом (если его нельзя отредактировать)."""
+    args = dict(peer_id=uid, random_id=random.getrandbits(31), message=text, disable_mentions=1)
+    if cmid:
+        try:
+            vk.messages.send(**args, forward=json.dumps(
+                {"peer_id": uid, "conversation_message_ids": [cmid], "is_reply": True}))
+            return
+        except ApiError as e:
+            log.info("Не удалось ответить на отчёт (%s) — шлю обычное сообщение", e)
+    try:
+        vk.messages.send(**args)
+    except ApiError as e:
+        log.warning("Не удалось отправить сообщение %s: %s", uid, e)
+
+
+def strip_report_button(rep, confirmed_by: str) -> bool:
+    """Убирает кнопку «Подтвердить» и дописывает вверху, кто подтвердил. False — отредактировать нельзя."""
+    if not rep["cmid"] or time.time() - rep["sent_ts"] >= EDIT_LIMIT_SEC:
         return False
-    text = render_report(tid)
+    text = render_report(rep["training_id"], note=rep["note"], confirmed_by=confirmed_by)
     # сначала явно пустая inline-клавиатура, затем — правка без клавиатуры
     for kb in (json.dumps({"buttons": [], "inline": True}), None):
-        args = dict(peer_id=uid, conversation_message_id=cmid, message=text, disable_mentions=1)
+        args = dict(peer_id=rep["user_id"], conversation_message_id=rep["cmid"], message=text,
+                    disable_mentions=1)
         if kb is not None:
             args["keyboard"] = kb
         try:
@@ -1144,20 +1565,33 @@ def handle_event(obj: dict):
     t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
     if not t:
         return answer_event(obj, "Тренировка не найдена")
-    if obj["user_id"] not in (t["leader_id"], t["stopper_id"]):
-        return answer_event(obj, "Подтвердить может только ведущий")
+    uid = obj["user_id"]
+    reps = report_rows(tid)
+    if uid not in {r["user_id"] for r in reps}:  # подтвердить может любой, кому отправлен отчёт
+        return answer_event(obj, "Подтвердить может только тот, кому отправлен отчёт")
     if t["status"] == "confirmed":
         return answer_event(obj, "Уже подтверждено")
-    if write_to_google_sheet(tid):
-        db.execute("UPDATE trainings SET status='confirmed' WHERE id=?", (tid,))
-        db.commit()
-        answer_event(obj, "Записано в таблицу ✔")
-        uid = obj["user_id"]
-        remove_report_keyboard(uid, obj.get("conversation_message_id"), tid)
-        d_part, t_part = training_label(t)
-        send_dm(uid, f"Отчёт о тренировке {d_part} {t_part} в беседе {chat_title(t['peer_id'])} записан")
-    else:
-        answer_event(obj, "Не удалось записать в таблицу. Подробности в логе бота — попробуй ещё раз позже")
+    if not write_to_google_sheet(tid):
+        return answer_event(obj, "Не удалось записать в таблицу. Подробности в логе бота — попробуй ещё раз позже")
+    db.execute("UPDATE trainings SET status='confirmed' WHERE id=?", (tid,))
+    db.commit()
+    answer_event(obj, "Записано в таблицу ✔")
+
+    confirmer = user_link(uid)
+    d_part, t_part = training_label(t)
+    done_text = f"Отчёт о тренировке {d_part} {t_part} в беседе {chat_title(t['peer_id'])} записан"
+    done_sent = False
+    for rep in reps:  # кнопка убирается во ВСЕХ отправленных сообщениях с отчётом
+        edited = strip_report_button(rep, confirmer)
+        if rep["user_id"] == uid:
+            if not done_sent:
+                if edited:
+                    send_dm(uid, done_text)
+                else:
+                    reply_to_report(uid, rep["cmid"], done_text)
+                done_sent = True
+        elif not edited:
+            reply_to_report(rep["user_id"], rep["cmid"], f"✔ Запись по этому отчёту подтвердил(а) {confirmer}")
 
 
 # ───────────────────────── запуск ─────────────────────────

@@ -33,6 +33,7 @@
       "start": datetime, "end": datetime,       # с часовым поясом МСК
       "chat_id": 1, "chat_title": "Название",
       "leader_id": 123, "leader_name": "Имя тренера", "leader_cw_id": 777 | "",
+      # (несколько тренеров — строки через запятую: "123, 456", "Имя1, Имя2", "777, 778")
       "participants": [
         {"vk_id": 456 | None, "cw_id": 888 | "", "name": "Иван", "join": datetime,
          "leave": datetime, "minutes": 80, "points": 1.5, "auto_leave": False},
@@ -506,7 +507,9 @@ def read_trainings(date_from: date = None, date_to: date = None):
             "date_end": _parse_date(r.get("Дата окончания", "")),
             "start": r.get("Начало", ""), "end": r.get("Окончание", ""),
             "chat_id": int(_num(r.get("ID беседы", ""))), "chat_title": r.get("Беседа", ""),
-            "leader_id": int(_num(r.get("ID ведущего", ""))),
+            # при нескольких тренерах в ячейках перечисление через запятую
+            "leader_id": int((re.findall(r"\d+", str(r.get("ID ведущего", ""))) or ["0"])[0]),
+            "leader_ids": [int(x) for x in re.findall(r"\d+", str(r.get("ID ведущего", "")))],
             "leader_cw_id": _int_or_text(r.get("CW ID тренера", "")),
             "leader_name": r.get("Ведущий", ""),
             "participants": int(_num(r.get("Участников", ""))),

@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS reports(
     user_id     INTEGER NOT NULL,                  -- кому отправлен отчёт (ЛС)
     message_id  INTEGER,
     cmid        INTEGER,
-    sent_ts     INTEGER NOT NULL
+    sent_ts     INTEGER NOT NULL,
+    note        TEXT                           -- пояснение вверху отчёта (почему отчёт пришёл именно вам)
 );
 
 -- Необязательные индексы (ускоряют поиск при большом объёме данных)
@@ -46,7 +47,8 @@ CREATE TABLE IF NOT EXISTS chats(
     enabled     INTEGER NOT NULL DEFAULT 1,    -- учёт баллов в беседе
     free_run    INTEGER NOT NULL DEFAULT 0,    -- свободный бег (задел)
     admins_only INTEGER NOT NULL DEFAULT 0,    -- тренировки ведут только админы беседы
-    added_ts    INTEGER
+    added_ts    INTEGER,
+    self_gov_days TEXT NOT NULL DEFAULT ''     -- дни самоуправления «0,2,5» (пн=0 … вс=6), пусто — отключено
 );
 
 -- Последнее сообщение с настройками для каждого администратора (его бот редактирует)
@@ -57,13 +59,31 @@ CREATE TABLE IF NOT EXISTS settings_msgs(
     text    TEXT
 );
 
--- Непонятные «#…»-сообщения во время тренировки: бот перечитывает их и ловит правки (#лапа с опечаткой)
-CREATE TABLE IF NOT EXISTS watched_msgs(
-    peer_id  INTEGER NOT NULL,
-    cmid     INTEGER NOT NULL,
-    from_id  INTEGER,
-    msg_date INTEGER,
-    text     TEXT,
-    added_ts INTEGER NOT NULL,
+-- Тренеры тренировки (можно несколько): «+ тренер», «#уход», правки отчёта
+CREATE TABLE IF NOT EXISTS trainers(
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    training_id INTEGER NOT NULL,
+    num         INTEGER NOT NULL,              -- постоянный номер тренера в отчёте
+    vk_id       INTEGER,                       -- NULL — добавлен вручную без страницы ВК
+    name        TEXT,                          -- NULL — взять из листа «Участники» / из ВК
+    join_ts     INTEGER NOT NULL,
+    leave_ts    INTEGER,
+    join_cmid   INTEGER,
+    leave_cmid  INTEGER
+);
+
+-- Журнал команд беседы: нужен для «/старт» задним числом и опроса правок
+CREATE TABLE IF NOT EXISTS msg_log(
+    peer_id    INTEGER NOT NULL,
+    cmid       INTEGER NOT NULL,
+    from_id    INTEGER,
+    date       INTEGER,
+    text       TEXT,
+    recognized INTEGER NOT NULL DEFAULT 1,     -- 0 — команда не сработала, следим за правками
+    added_ts   INTEGER NOT NULL,
     PRIMARY KEY (peer_id, cmid)
 );
+
+-- Добавлено в более старые таблицы (бот делает это сам при запуске):
+--   ALTER TABLE chats   ADD COLUMN self_gov_days TEXT NOT NULL DEFAULT '';   -- дни самоуправления «0,2,5» (пн=0)
+--   ALTER TABLE reports ADD COLUMN note TEXT;                                -- пояснение вверху отчёта
