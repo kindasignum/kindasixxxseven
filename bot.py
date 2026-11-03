@@ -158,6 +158,12 @@ def ensure_column(table: str, col: str, ddl: str):
 
 ensure_column("chats", "self_gov_days", "TEXT NOT NULL DEFAULT ''")
 ensure_column("reports", "note", "TEXT")
+ensure_column("reports", "page", "INTEGER NOT NULL DEFAULT 0")
+db.execute(
+    "CREATE TABLE IF NOT EXISTS edit_sessions("
+    "user_id INTEGER PRIMARY KEY, training_id INTEGER NOT NULL, kind TEXT NOT NULL, "
+    "num INTEGER, cmid INTEGER, ts INTEGER NOT NULL)"
+)
 db.commit()
 
 # ───────────────────────── утилиты ─────────────────────────
@@ -537,26 +543,7 @@ def write_to_google_sheet(training_id: int) -> bool:
 
 
 # ───────────────────────── отчёт ─────────────────────────
-REPORT_HELP = (
-    "Проверь, что всё правильно. Если время присоединения к тренировке или ухода "
-    "с неё отличается от реального, отправь ответным сообщением номер участника "
-    "и настоящее время присутствия на тренировке. Например:\n\n"
-    "1 15:00-16:30\n\n"
-    "Если тренировка шла через полночь, просто укажи время, например 23:30-00:45 — "
-    "бот сам определит дату.\n\n"
-    "Если в отчёте есть лишний участник или кого-то не хватает, отправь ответным "
-    "сообщением «+» или «-», имя участника (или его номер) и время участия, если "
-    "есть. Например:\n\n"
-    "+ Лихушек 15:00-16:30\n"
-    "- Лихушек\n\n"
-    "Если имя участника записано неверно, исправь его:\n\n"
-    "1 имя Лихушек\n\n"
-    "Тренеры правятся так же, но со словом «тренер»:\n\n"
-    "тренер 1 15:00-16:30\n"
-    "+ тренер Имя на варе 15:00-16:30\n"
-    "- тренер 2\n\n"
-    "Когда всё будет верно, нажми «Подтвердить»."
-)
+REPORT_HELP = "Если что-то неверно, исправь отчёт кнопками ниже. Когда всё будет верно, нажми «Подтвердить»."
 
 
 def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
@@ -627,7 +614,7 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
     notes = []
     if unmatched:
         notes.append("⚠ — персонаж не найден на листе «Участники», CW ID не будет записан. "
-                     "Если имя написано с ошибкой, исправь его: «N имя Верное Имя».")
+                     "Если имя написано с ошибкой, нажми на участника и исправь имя.")
     if trainer_warn[0]:
         notes.append("⚠ Тренер не найден на листе «Участники» по VK ID — CW ID тренера останется пустым.")
     if notes:
@@ -637,8 +624,57 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
     return "\n".join(out)
 
 
-def confirm_kb(tid: int) -> str:
+REPORT_PAGE = 5  # записей на страницу (inline-клавиатура VK: ≤ 6 строк и ≤ 10 кнопок → по две кнопки в ряд)
+
+
+def _entry_label(prefix: str, num: int, name: str, j: int, l: int, warn: bool) -> str:
+    head = ("⚠ " if warn else "") + f"{prefix}{num}. "
+    tail = f" {dt(j):%H:%M}-{dt(l):%H:%M}"
+    room = 40 - len(head) - len(tail)  # у кнопки VK не больше 40 символов
+    if len(name) > room:
+        name = name[:max(room - 1, 1)] + "…"
+    return head + name + tail
+
+
+def report_entries(tid: int):
+    """Записи для кнопок: тренеры (если их больше одного), затем участники."""
+    t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
+    ensure_trainers(t)
+    members = get_members()
+    out = []
+    trs = trainer_rows(tid)
+    if len(trs) > 1:
+        for r in trs:
+            name, _, found = trainer_view(r, members)
+            out.append({"k": "t", "n": r["num"], "label": _entry_label(
+                "Тр. ", r["num"], name, r["join_ts"], r["leave_ts"] or t["end_ts"], bool(members) and not found)})
+    for p in db.execute("SELECT * FROM participants WHERE training_id=? ORDER BY num", (tid,)):
+        warn = bool(members) and not members.participant(p["name"], p["vk_id"])
+        out.append({"k": "p", "n": p["num"], "label": _entry_label(
+            "", p["num"], p["name"], p["join_ts"], p["leave_ts"] or t["end_ts"], warn)})
+    return out
+
+
+def confirm_kb(tid: int, page: int = 0) -> str:
+    """Кнопки правок (по 5 записей на странице) + «Добавить участника» + «Подтвердить» (всегда последняя)."""
+    entries = report_entries(tid)
+    pages = max(1, -(-len(entries) // REPORT_PAGE))
+    page = max(0, min(page, pages - 1))
+    chunk = entries[page * REPORT_PAGE:(page + 1) * REPORT_PAGE]
+    sec = VkKeyboardColor.SECONDARY
     kb = VkKeyboard(inline=True)
+    for i, e in enumerate(chunk):
+        if i and i % 2 == 0:
+            kb.add_line()
+        kb.add_callback_button(e["label"], sec, payload={"cmd": "rp_sel", "tid": tid, "k": e["k"], "n": e["n"]})
+    if chunk:
+        kb.add_line()
+    if page > 0:
+        kb.add_callback_button("◀", sec, payload={"cmd": "rp_page", "tid": tid, "pg": page - 1})
+    kb.add_callback_button("Добавить участника", sec, payload={"cmd": "rp_add", "tid": tid})
+    if page < pages - 1:
+        kb.add_callback_button("▶", sec, payload={"cmd": "rp_page", "tid": tid, "pg": page + 1})
+    kb.add_line()
     kb.add_callback_button(
         "Подтвердить", VkKeyboardColor.POSITIVE, payload={"cmd": "confirm", "tid": tid}
     )
@@ -652,7 +688,7 @@ def send_report_message(tid: int, uid: int, note: str = None) -> bool:
             peer_ids=uid,
             random_id=random.getrandbits(31),
             message=render_report(tid, note=note),
-            keyboard=confirm_kb(tid),
+            keyboard=confirm_kb(tid, 0),
             disable_mentions=1,
         )
     except ApiError as e:
@@ -733,7 +769,7 @@ def update_report(rep):
                 peer_id=uid,
                 conversation_message_id=rep["cmid"],
                 message=render_report(tid, note=rep["note"]),
-                keyboard=confirm_kb(tid),
+                keyboard=confirm_kb(tid, rep["page"] or 0),
                 disable_mentions=1,
             )
             return
@@ -1138,6 +1174,7 @@ RE_PM = re.compile(rf"^([+\-])\s*(.+?)(?:\s+{TIME}\s*[-–—]\s*{TIME})?$")
 # строки про тренеров: «тренер 1 15:00-16:30», «+ тренер Имя 15:00-16:30», «- тренер 2»
 RE_T_FIX = re.compile(rf"^тренер\s+\[?(\d+)\]?\s+{TIME}\s*[-–—]\s*{TIME}$", re.I)
 RE_T_PM = re.compile(rf"^([+\-])\s*тренер\s+(.+?)(?:\s+{TIME}\s*[-–—]\s*{TIME})?$", re.I)
+RE_T_RENAME = re.compile(r"^тренер\s+\[?(\d+)\]?\s+имя\s+(.+)$", re.I)
 RE_VK_REF = re.compile(r"^(?:https?://)?(?:m\.)?(?:vk\.(?:com|ru)/)?id(\d+)/?$", re.I)
 
 
@@ -1184,6 +1221,16 @@ def apply_edits(tid: int, lines):
     members = get_members()  # до транзакции: может обращаться к Google Таблице
     with db:  # атомарно: при ошибке откат всех строк
         for ln in lines:
+            m = RE_T_RENAME.match(ln)
+            if m:
+                name = norm_name(m.group(2))
+                if not name:
+                    raise EditError("пустое имя")
+                cur = db.execute("UPDATE trainers SET name=? WHERE training_id=? AND num=?",
+                                 (name, tid, int(m.group(1))))
+                if cur.rowcount == 0:
+                    raise EditError(f"нет тренера {m.group(1)}")
+                continue
             m = RE_T_FIX.match(ln)
             if m:
                 j, l = _span(t, *m.groups()[1:])
@@ -1276,6 +1323,127 @@ def apply_edits(tid: int, lines):
                     removed = len(ids)
                 if removed == 0:
                     raise EditError(f"не найден: {arg}")
+
+
+RE_S_NAME = re.compile(r"^имя\s+(.+)$", re.I | re.S)
+RE_S_TIME = re.compile(r"^время\s+(\d{1,2})[:.](\d{2})\s*[-–—]\s*(\d{1,2})[:.](\d{2})$", re.I)
+
+
+def get_session(uid: int):
+    return db.execute("SELECT * FROM edit_sessions WHERE user_id=?", (uid,)).fetchone()
+
+
+def clear_session(uid: int, cmid=None):
+    """Удаляет сессию; если указан cmid — только если она связана с этим сообщением."""
+    if cmid is None:
+        db.execute("DELETE FROM edit_sessions WHERE user_id=?", (uid,))
+    else:
+        db.execute("DELETE FROM edit_sessions WHERE user_id=? AND cmid=?", (uid, cmid))
+    db.commit()
+
+
+def get_entry(tid: int, k: str, n: int):
+    tbl = "trainers" if k == "t" else "participants"
+    return db.execute(f"SELECT * FROM {tbl} WHERE training_id=? AND num=?", (tid, n)).fetchone()
+
+
+def entry_text(tid: int, k: str, n: int):
+    row = get_entry(tid, k, n)
+    if not row:
+        return None
+    t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
+    if k == "t":
+        name = trainer_view(row, get_members())[0]
+        leave = row["leave_ts"] or t["end_ts"]
+    else:
+        name, leave = row["name"], row["leave_ts"] or t["end_ts"]
+    return (f"Выбран {'тренер' if k == 't' else 'участник'}: {n}. {name}, "
+            f"{fmt_t(row['join_ts'], t['start_ts'])} - {fmt_t(leave, t['start_ts'])}\n\n"
+            "Отправь ответным сообщением:\n"
+            "имя Новое Имя — сменить имя\n"
+            "время 15:00-16:30 — изменить время участия\n\n"
+            "«Удалить» убирает из отчёта, «Вернуться» закрывает это сообщение.")
+
+
+def entry_kb(tid: int, k: str, n: int) -> str:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("Удалить", VkKeyboardColor.NEGATIVE, payload={"cmd": "rp_del", "tid": tid, "k": k, "n": n})
+    kb.add_callback_button("Вернуться", VkKeyboardColor.SECONDARY, payload={"cmd": "rp_back"})
+    return kb.get_keyboard()
+
+
+ADD_TEXT = (
+    "Добавление включено: я слушаю новые сообщения. Отправь ответным сообщением (можно несколько строк):\n\n"
+    "Имя 15:00-16:30 — добавить участника\n"
+    "тренер Имя 15:00-16:30 — добавить тренера (имя на варе или id123)\n\n"
+    "Время можно не указывать — тогда человек будет записан на всю тренировку. "
+    "Чтобы закончить, нажми «Вернуться»."
+)
+
+
+def open_session(uid: int, tid: int, kind: str, num, text: str, kb: str):
+    old = get_session(uid)
+    if old and old["cmid"]:
+        delete_msg(uid, old["cmid"])  # одновременно активно только одно сообщение правок
+    cmid = send_with_kb(uid, text, kb)
+    if cmid is None:
+        clear_session(uid)
+        return
+    db.execute("INSERT OR REPLACE INTO edit_sessions(user_id,training_id,kind,num,cmid,ts) VALUES(?,?,?,?,?,?)",
+               (uid, tid, kind, num, cmid, int(time.time())))
+    db.commit()
+
+
+def apply_session_lines(sess, lines):
+    tid, kind, n = sess["training_id"], sess["kind"], sess["num"]
+    conv = []
+    for ln in lines:
+        if kind == "add":
+            if ln[:1] in ("+", "-"):
+                conv.append(ln)
+                continue
+            if not re.search(r"[^\W\d_]", re.sub(r"\d{1,2}[:.]\d{2}", "", ln)):
+                raise EditError("нет имени")
+            conv.append("+ " + ln)
+            continue
+        pre = f"тренер {n}" if kind == "t" else f"{n}"
+        m = RE_S_NAME.match(ln)
+        if m:
+            conv.append(f"{pre} имя {m.group(1)}")
+            continue
+        m = RE_S_TIME.match(ln)
+        if not m:
+            raise EditError(f"не понял строку: {ln}")
+        conv.append(f"{pre} {m.group(1)}:{m.group(2)}-{m.group(3)}:{m.group(4)}")
+    apply_edits(tid, conv)
+
+
+def handle_session_msg(uid: int, cmid, lines) -> bool:
+    """Сообщение пользователя при открытом сообщении правок. True — обработано, False — разбирать по-старому."""
+    sess = get_session(uid)
+    if not sess:
+        return False
+    t = db.execute("SELECT * FROM trainings WHERE id=?", (sess["training_id"],)).fetchone()
+    if not t or t["status"] == "confirmed" or time.time() - sess["ts"] > EDIT_LIMIT_SEC:
+        clear_session(uid)
+        return False
+    if sess["kind"] != "add" and not all(RE_S_NAME.match(l) or RE_S_TIME.match(l) for l in lines):
+        return False
+    tid = sess["training_id"]
+    try:
+        apply_session_lines(sess, lines)
+    except EditError as e:
+        log.info("Правка отклонена: %s", e)
+        react(uid, cmid, "question")
+        return True
+    autocorrect_participants(tid)
+    update_all_reports(tid)
+    if sess["kind"] != "add":
+        text = entry_text(tid, sess["kind"], sess["num"])
+        if text:
+            edit_msg(uid, sess["cmid"], text, entry_kb(tid, sess["kind"], sess["num"]))
+    react(uid, cmid, "check")
+    return True
 
 
 def find_report(uid: int, msg: dict):
@@ -1634,10 +1802,12 @@ def handle_private(msg: dict):
         return
     if handle_settings(msg):
         return
+    lines = [l.strip() for l in (msg.get("text") or "").splitlines() if l.strip()]
+    if lines and handle_session_msg(uid, cmid, lines):
+        return
     rep = find_report(uid, msg)
     if not rep:
         return
-    lines = [l.strip() for l in (msg.get("text") or "").splitlines() if l.strip()]
     if not lines:
         return
     try:
@@ -1702,10 +1872,64 @@ def strip_report_button(rep, confirmed_by: str) -> bool:
     return False
 
 
+def handle_report_event(obj: dict):
+    """Кнопки правок отчёта (payload.cmd начинается с «rp_»)."""
+    uid, cmid = obj["user_id"], obj.get("conversation_message_id")
+    p = obj.get("payload") or {}
+    cmd, tid = p.get("cmd"), p.get("tid")
+    if cmd == "rp_back":  # закрыть сообщение правок / добавления
+        delete_msg(uid, cmid)
+        clear_session(uid, cmid)
+        return answer_event(obj)
+    t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
+    if not t:
+        return answer_event(obj, "Тренировка не найдена")
+    if uid not in {r["user_id"] for r in report_rows(tid)}:
+        return answer_event(obj, "Править отчёт может только тот, кому он отправлен")
+    if t["status"] == "confirmed":
+        return answer_event(obj, "Уже подтверждено")
+    try:
+        k, n = p.get("k"), int(p.get("n") or 0)
+        if cmd == "rp_page":
+            rep_row = db.execute("SELECT * FROM reports WHERE training_id=? AND user_id=? AND cmid=?",
+                                 (tid, uid, cmid)).fetchone()
+            if rep_row:
+                db.execute("UPDATE reports SET page=? WHERE id=?", (int(p.get("pg", 0)), rep_row["id"]))
+                db.commit()
+                update_report(db.execute("SELECT * FROM reports WHERE id=?", (rep_row["id"],)).fetchone())
+        elif cmd == "rp_sel":
+            text = entry_text(tid, k, n)
+            if not text:
+                return answer_event(obj, "Не найден (возможно, уже удалён)")
+            open_session(uid, tid, k, n, text, entry_kb(tid, k, n))
+        elif cmd == "rp_add":
+            kb = VkKeyboard(inline=True)
+            kb.add_callback_button("Вернуться", VkKeyboardColor.SECONDARY, payload={"cmd": "rp_back"})
+            open_session(uid, tid, "add", None, ADD_TEXT, kb.get_keyboard())
+        elif cmd == "rp_del":
+            ensure_trainers(t)
+            if k == "t":
+                if len(trainer_rows(tid)) <= 1:
+                    return answer_event(obj, "Нельзя удалить единственного тренера")
+                db.execute("DELETE FROM trainers WHERE training_id=? AND num=?", (tid, n))
+            else:
+                db.execute("DELETE FROM participants WHERE training_id=? AND num=?", (tid, n))
+            db.commit()
+            delete_msg(uid, cmid)
+            clear_session(uid, cmid)
+            update_all_reports(tid)
+        answer_event(obj)
+    except Exception:  # noqa: BLE001
+        log.exception("Ошибка обработки кнопки правок")
+        answer_event(obj, "Не удалось выполнить действие")
+
+
 def handle_event(obj: dict):
     payload = obj.get("payload") or {}
     if str(payload.get("cmd", "")).startswith("cs_"):
         return handle_settings_event(obj)
+    if str(payload.get("cmd", "")).startswith("rp_"):
+        return handle_report_event(obj)
     if payload.get("cmd") != "confirm":
         return
     tid = payload.get("tid")
@@ -1723,6 +1947,10 @@ def handle_event(obj: dict):
     db.execute("UPDATE trainings SET status='confirmed' WHERE id=?", (tid,))
     db.commit()
     answer_event(obj, "Записано в таблицу ✔")
+    for ss in db.execute("SELECT * FROM edit_sessions WHERE training_id=?", (tid,)).fetchall():
+        delete_msg(ss["user_id"], ss["cmid"])
+    db.execute("DELETE FROM edit_sessions WHERE training_id=?", (tid,))
+    db.commit()
 
     confirmer = user_link(uid)
     d_part, t_part = training_label(t)

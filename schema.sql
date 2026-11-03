@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS reports(
     message_id  INTEGER,
     cmid        INTEGER,
     sent_ts     INTEGER NOT NULL,
-    note        TEXT                           -- пояснение вверху отчёта (почему отчёт пришёл именно вам)
+    note        TEXT,                          -- пояснение вверху отчёта (почему отчёт пришёл именно вам)
+    page        INTEGER NOT NULL DEFAULT 0     -- страница кнопок правок в этом сообщении (по 5 записей)
 );
 
 -- Необязательные индексы (ускоряют поиск при большом объёме данных)
@@ -84,6 +85,18 @@ CREATE TABLE IF NOT EXISTS msg_log(
     PRIMARY KEY (peer_id, cmid)
 );
 
+-- Открытое сообщение правок отчёта в ЛС (выбранный участник/тренер или режим добавления).
+-- Одна запись на человека: следующие его сообщения «имя …», «время …» или «Имя 15:00-16:30» применяются к ней
+CREATE TABLE IF NOT EXISTS edit_sessions(
+    user_id     INTEGER PRIMARY KEY,           -- кто правит отчёт
+    training_id INTEGER NOT NULL,
+    kind        TEXT NOT NULL,                 -- p — участник, t — тренер, add — добавление
+    num         INTEGER,                       -- номер участника/тренера в отчёте (для add — NULL)
+    cmid        INTEGER,                       -- сообщение бота с кнопками правок
+    ts          INTEGER NOT NULL
+);
+
 -- Добавлено в более старые таблицы (бот делает это сам при запуске):
 --   ALTER TABLE chats   ADD COLUMN self_gov_days TEXT NOT NULL DEFAULT '';   -- дни самоуправления «0,2,5» (пн=0)
 --   ALTER TABLE reports ADD COLUMN note TEXT;                                -- пояснение вверху отчёта
+--   ALTER TABLE reports ADD COLUMN page INTEGER NOT NULL DEFAULT 0;          -- страница кнопок правок
