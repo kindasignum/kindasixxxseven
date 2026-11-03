@@ -755,9 +755,9 @@ MENTION_RE = re.compile(r"^\s*\[club\d+\|[^\]]*\]\s*,?\s*", re.I)
 CLOCK = r"(?:[ \t]+(?:в[ \t]+)?(\d{1,2})[:.](\d{2})(?!\d))?"
 RE_START = re.compile(r"(?<![\w/])/старт(?!\w)" + CLOCK, re.I)
 RE_STOP = re.compile(r"(?<![\w/])/стоп(?!\w)" + CLOCK, re.I)
-RE_JOIN = re.compile(r"^#лапа\s+(.+)$", re.I | re.S)
-RE_LEAVE = re.compile(r"^#уход\s+(.+)$", re.I | re.S)
-RE_LEAVE_BARE = re.compile(r"^#уход\s*$", re.I)       # «#уход» без имени — уходит тренер
+# команда может стоять после другого текста: берётся только то, что написано ПОСЛЕ неё
+RE_JOIN = re.compile(r"(?<![\w#])#лапа(?!\w)\s+(.+)$", re.I | re.S)
+RE_LEAVE = re.compile(r"(?<![\w#])#уход(?!\w)[ \t]*(.*)$", re.I | re.S)  # без имени — уходит тренер
 RE_ADD_TRAINER = re.compile(r"^\+\s*тренер(?!\w)", re.I)  # «+ тренер» — стать тренером активной тренировки
 
 RETRO_STOP_WINDOW_SEC = 2 * 3600   # правка «/старт»: если за 2 часа после него есть «/стоп» — не стартуем
@@ -856,9 +856,9 @@ def classify(text: str):
     """Какая команда в тексте: start / join / leave / add_trainer / stop (порядок важен) или None."""
     if RE_START.search(text):
         return "start"
-    if RE_JOIN.match(text):
+    if RE_JOIN.search(text):
         return "join"
-    if RE_LEAVE.match(text) or RE_LEAVE_BARE.match(text):
+    if RE_LEAVE.search(text):
         return "leave"
     if RE_ADD_TRAINER.match(text):
         return "add_trainer"
@@ -871,14 +871,14 @@ def process_member_command(peer: int, chat, tr, uid: int, cmid, text: str, ts: i
     """#лапа, #уход, «+ тренер» в активной тренировке. True — команда дала эффект (или осознанно проигнорирована)."""
     ensure_trainers(tr)
     if kind == "join":
-        name = norm_name(RE_JOIN.match(text).group(1))
+        name = norm_name(RE_JOIN.search(text).group(1))
         if not name:
             return False
         process_join(peer, tr, uid, cmid, name, ts)
         return True
 
     if kind == "leave":
-        m = RE_LEAVE.match(text)
+        m = RE_LEAVE.search(text)
         name = norm_name(m.group(1)) if m else ""
         p = None
         if name:
@@ -1024,7 +1024,8 @@ def is_command_like(text: str) -> bool:
 
 def worth_watching(text: str) -> bool:
     """Стоит ли перечитывать нераспознанное сообщение: похоже на неудавшуюся команду."""
-    return text.startswith(("#", "/")) or bool(re.match(r"\+\s*т", text, re.I))
+    return (text.startswith(("#", "/")) or bool(re.search(r"(?<![\w#])#(?:лапа|уход)(?!\w)", text, re.I))
+            or bool(re.match(r"\+\s*т", text, re.I)))
 
 
 def log_message(peer: int, uid: int, cmid, date: int, text: str, recognized: bool):
@@ -1304,16 +1305,7 @@ SETTINGS_COLS = {
     "сб+": ("free_run", 1), "сб-": ("free_run", 0),
     "админы+": ("admins_only", 1), "админы-": ("admins_only", 0),
 }
-SETTINGS_HELP = (
-    "Чтобы изменить настройки, введи номер беседы и параметр (можно несколько строк):\n"
-    "• вкл/выкл — подключить или отключить учёт баллов в беседе\n"
-    "• сб+/сб- — подключить или отключить учёт свободного бега\n"
-    "• админы+/админы- — подключить проведение тренировок только администраторами "
-    "или всеми участниками\n"
-    "• сам пн,ср,сб / сам- — день самоуправления: выбрать дни недели, когда тренировки может "
-    "проводить любой участник (также: будни, выходные, ежедневно), или отключить режим\n\n"
-    "Например: 1 вкл"
-)
+SETTINGS_HELP = "Нажми на беседу, чтобы изменить её настройки."
 
 DAY_ALIASES = {
     "пн": 0, "пон": 0, "понедельник": 0, "вт": 1, "вторник": 1, "ср": 2, "среда": 2, "чт": 3,
@@ -1426,37 +1418,191 @@ def apply_settings(lines) -> bool:
     return True
 
 
-def show_settings(uid: int, force_new: bool):
-    """
-    /настройка → новое сообщение со списком. Последующие правки → редактируем это же сообщение;
-    если с его отправки прошло больше 24 часов (или редактирование не удалось) — шлём новое.
-    """
+CHATS_PER_PAGE = 8  # inline-клавиатура VK: не больше 10 кнопок и 6 строк
+SETTING_FLAGS = {"enabled", "free_run", "admins_only"}
+CLOSED_KB = json.dumps({"buttons": [], "inline": True})
+SEC, POS, NEG = VkKeyboardColor.SECONDARY, VkKeyboardColor.POSITIVE, VkKeyboardColor.NEGATIVE
+
+
+def _btn(kb, label: str, color, **payload):
+    kb.add_callback_button(label[:40], color, payload=payload)
+
+
+def chat_num(c) -> int:
+    return c["peer_id"] - 2_000_000_000
+
+
+def main_settings_view(page: int = 0):
+    """(текст, клавиатура) общего сообщения: список бесед и кнопки с их названиями."""
     text = render_settings()
+    chats = db.execute("SELECT * FROM chats ORDER BY peer_id").fetchall()
+    if not chats:
+        return text, None
+    pages = (len(chats) + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE
+    page = max(0, min(page, pages - 1))
+    kb = VkKeyboard(inline=True)
+    for i, c in enumerate(chats[page * CHATS_PER_PAGE:(page + 1) * CHATS_PER_PAGE]):
+        if i and i % 2 == 0:
+            kb.add_line()
+        _btn(kb, f"{chat_num(c)}. {c['title'] or 'Без названия'}", SEC, cmd="cs_chat", peer=c["peer_id"], pg=page)
+    if pages > 1:
+        kb.add_line()
+        if page > 0:
+            _btn(kb, "◀ Назад", SEC, cmd="cs_page", pg=page - 1)
+        if page < pages - 1:
+            _btn(kb, "Вперёд ▶", SEC, cmd="cs_page", pg=page + 1)
+    return text, kb.get_keyboard()
+
+
+def chat_settings_view(c, pg: int):
+    """(текст, клавиатура) сообщения с настройками одной беседы."""
+    text = "\n".join([
+        f"Беседа {chat_num(c)}. {c['title'] or 'Без названия'}",
+        f"Учёт баллов: {'включён' if c['enabled'] else 'отключен'}",
+        f"Свободный бег: {'включён' if c['free_run'] else 'отключен'}",
+        f"Тренировки проводят: {'только администраторы' if c['admins_only'] else 'все участники'}",
+        f"День самоуправления: {fmt_days(c['self_gov_days'])}",
+    ])
+    peer = c["peer_id"]
+    kb = VkKeyboard(inline=True)
+    _btn(kb, "Бот: включён" if c["enabled"] else "Бот: отключен", POS if c["enabled"] else NEG,
+         cmd="cs_tog", f="enabled", peer=peer, pg=pg)
+    kb.add_line()
+    _btn(kb, "Свободный бег", POS if c["free_run"] else NEG, cmd="cs_tog", f="free_run", peer=peer, pg=pg)
+    kb.add_line()
+    _btn(kb, "Тренеры: только администраторы" if c["admins_only"] else "Тренеры: все участники", SEC,
+         cmd="cs_tog", f="admins_only", peer=peer, pg=pg)
+    kb.add_line()
+    _btn(kb, f"ДС: {fmt_days(c['self_gov_days'])}", SEC, cmd="cs_days", peer=peer, pg=pg)
+    kb.add_line()
+    _btn(kb, "Вернуться", SEC, cmd="cs_back", peer=peer, pg=pg)
+    return text, kb.get_keyboard()
+
+
+def days_view(c, pg: int, pc):
+    """(текст, клавиатура) выбора дней самоуправления. pc — ID сообщения с настройками беседы (его тоже обновляем)."""
+    sel = self_gov_set(c)
+    peer = c["peer_id"]
+    text = (f"День самоуправления — беседа {chat_num(c)}. {c['title'] or 'Без названия'}\n"
+            "В выбранные дни тренировки может проводить любой участник беседы.\n"
+            f"Сейчас: {fmt_days(c['self_gov_days'])}")
+    kb = VkKeyboard(inline=True)
+    _btn(kb, "Отключен", NEG if not sel else SEC, cmd="cs_day", d=-1, peer=peer, pg=pg, pc=pc)
+    for d in range(7):
+        if d % 4 == 0:
+            kb.add_line()
+        _btn(kb, DAY_NAMES[d], POS if d in sel else SEC, cmd="cs_day", d=d, peer=peer, pg=pg, pc=pc)
+    kb.add_line()
+    _btn(kb, "Вернуться", SEC, cmd="cs_dback", peer=peer, pg=pg, pc=pc)
+    return text, kb.get_keyboard()
+
+
+def send_with_kb(uid: int, text: str, kb):
+    """Новое сообщение с inline-клавиатурой. Возвращает conversation_message_id или None."""
+    args = dict(peer_ids=uid, random_id=random.getrandbits(31), message=text, disable_mentions=1)
+    if kb:
+        args["keyboard"] = kb
+    try:
+        r = vk.messages.send(**args)
+    except ApiError as e:
+        log.warning("Не удалось отправить сообщение %s: %s", uid, e)
+        return None
+    item = r[0] if r else {}
+    if item.get("error"):
+        log.warning("Сообщение для %s не доставлено: %s", uid, item["error"])
+        return None
+    return item.get("conversation_message_id")
+
+
+def edit_msg(uid: int, cmid, text: str, kb=None) -> bool:
+    if not cmid:
+        return False
+    try:
+        vk.messages.edit(peer_id=uid, conversation_message_id=cmid, message=text,
+                         keyboard=kb or CLOSED_KB, disable_mentions=1)
+        return True
+    except ApiError as e:
+        log.info("Не удалось отредактировать сообщение %s: %s", cmid, e)
+        return False
+
+
+def delete_msg(uid: int, cmid):
+    """Удаляет сообщение бота; если VK не даёт (прошло больше суток) — убирает кнопки и пишет «закрыто»."""
+    if not cmid:
+        return
+    try:
+        vk.messages.delete(peer_id=uid, cmids=cmid, delete_for_all=1)
+    except ApiError as e:
+        log.info("Не удалось удалить сообщение %s (%s) — убираю кнопки", cmid, e)
+        edit_msg(uid, cmid, "Закрыто", None)
+
+
+def show_settings(uid: int, force_new: bool, page: int = 0):
+    """
+    /настройка → новое сообщение со списком бесед и кнопками. Последующие изменения → редактируем это же
+    сообщение; если с его отправки прошло больше 24 часов (или редактирование не удалось) — шлём новое.
+    """
+    text, kb = main_settings_view(page)
     row = db.execute("SELECT * FROM settings_msgs WHERE user_id=?", (uid,)).fetchone()
     if row and row["cmid"] and not force_new and time.time() - row["sent_ts"] < EDIT_LIMIT_SEC:
         if row["text"] == text:
             return  # ничего не изменилось — VK не даёт «отредактировать» в такой же текст
-        try:
-            vk.messages.edit(peer_id=uid, conversation_message_id=row["cmid"],
-                             message=text, disable_mentions=1)
+        if edit_msg(uid, row["cmid"], text, kb):
             db.execute("UPDATE settings_msgs SET text=? WHERE user_id=?", (text, uid))
             db.commit()
             return
-        except ApiError as e:
-            log.info("Не удалось отредактировать сообщение настроек (%s) — шлю новое", e)
-    try:
-        r = vk.messages.send(peer_ids=uid, random_id=random.getrandbits(31),
-                             message=text, disable_mentions=1)
-    except ApiError as e:
-        log.warning("Не удалось отправить настройки %s: %s", uid, e)
-        return
-    item = r[0] if r else {}
-    if item.get("error"):
-        log.warning("Настройки для %s не доставлены: %s", uid, item["error"])
+    cmid = send_with_kb(uid, text, kb)
+    if cmid is None:
         return
     db.execute("INSERT OR REPLACE INTO settings_msgs(user_id,cmid,sent_ts,text) VALUES(?,?,?,?)",
-               (uid, item.get("conversation_message_id"), int(time.time()), text))
+               (uid, cmid, int(time.time()), text))
     db.commit()
+
+
+def handle_settings_event(obj: dict):
+    """Нажатия кнопок настроек (payload.cmd начинается с «cs_»). Только администраторы сообщества."""
+    uid, cmid = obj["user_id"], obj.get("conversation_message_id")
+    p = obj.get("payload") or {}
+    cmd = p.get("cmd")
+    if not is_group_admin(uid):
+        return answer_event(obj, "Настройки доступны только администраторам сообщества")
+    try:
+        pg = int(p.get("pg", 0))
+        if cmd == "cs_page":
+            text, kb = main_settings_view(pg)
+            edit_msg(uid, cmid, text, kb)
+            return answer_event(obj)
+        peer = int(p.get("peer", 0))
+        c = get_chat(peer)
+        if not c:
+            return answer_event(obj, "Беседа не найдена (возможно, бота исключили)")
+        if cmd == "cs_chat":
+            send_with_kb(uid, *chat_settings_view(c, pg))
+        elif cmd == "cs_tog":
+            f = p.get("f")
+            if f in SETTING_FLAGS:
+                db.execute(f"UPDATE chats SET {f}=1-{f} WHERE peer_id=?", (peer,))
+                db.commit()
+                edit_msg(uid, cmid, *chat_settings_view(get_chat(peer), pg))
+                show_settings(uid, force_new=False, page=pg)
+        elif cmd == "cs_days":
+            send_with_kb(uid, *days_view(c, pg, cmid))
+        elif cmd == "cs_day":
+            d = int(p.get("d", -1))
+            new = set() if d < 0 else (self_gov_set(c) ^ ({d} if 0 <= d <= 6 else set()))
+            db.execute("UPDATE chats SET self_gov_days=? WHERE peer_id=?",
+                       (",".join(str(x) for x in sorted(new)), peer))
+            db.commit()
+            c = get_chat(peer)
+            edit_msg(uid, cmid, *days_view(c, pg, p.get("pc")))
+            edit_msg(uid, p.get("pc"), *chat_settings_view(c, pg))
+            show_settings(uid, force_new=False, page=pg)
+        elif cmd in ("cs_back", "cs_dback"):
+            delete_msg(uid, cmid)
+        answer_event(obj)
+    except Exception:  # noqa: BLE001
+        log.exception("Ошибка обработки кнопки настроек")
+        answer_event(obj, "Не удалось выполнить действие")
 
 
 def handle_settings(msg: dict) -> bool:
@@ -1506,14 +1652,13 @@ def handle_private(msg: dict):
 
 
 # ───────────────────────── кнопка «Подтвердить» ─────────────────────────
-def answer_event(event_obj: dict, text: str):
+def answer_event(event_obj: dict, text: str = None):
+    """Отвечает на нажатие callback-кнопки (без текста — просто гасит «загрузку»)."""
+    args = dict(event_id=event_obj["event_id"], user_id=event_obj["user_id"], peer_id=event_obj["peer_id"])
+    if text:
+        args["event_data"] = json.dumps({"type": "show_snackbar", "text": text})
     try:
-        vk.messages.sendMessageEventAnswer(
-            event_id=event_obj["event_id"],
-            user_id=event_obj["user_id"],
-            peer_id=event_obj["peer_id"],
-            event_data=json.dumps({"type": "show_snackbar", "text": text}),
-        )
+        vk.messages.sendMessageEventAnswer(**args)
     except ApiError as e:
         log.warning("sendMessageEventAnswer: %s", e)
 
@@ -1559,6 +1704,8 @@ def strip_report_button(rep, confirmed_by: str) -> bool:
 
 def handle_event(obj: dict):
     payload = obj.get("payload") or {}
+    if str(payload.get("cmd", "")).startswith("cs_"):
+        return handle_settings_event(obj)
     if payload.get("cmd") != "confirm":
         return
     tid = payload.get("tid")
