@@ -3,8 +3,10 @@
 
 ЗАПИСЬ
     write_training(training: dict) -> dict      — записать тренировку (идемпотентно)
+    write_free_run(training: dict) -> dict      — записать забег свободного бега на лист «Свободный бег»
 ЧТЕНИЕ
     read_trainings(date_from=None, date_to=None)      -> list[dict]
+    read_free_run(date_from=None, date_to=None)       -> list[dict]  (лист «Свободный бег»)
     read_participations(date_from=None, date_to=None, vk_id=None, name=None) -> list[dict]
     points_summary(date_from=None, date_to=None)      -> list[dict]  (баллы по участникам)
     has_training(key) -> bool
@@ -66,6 +68,10 @@ TRAININGS_HEADERS = [
 PARTS_HEADERS = [
     "Ключ", "Дата тренировки", "Беседа", "Ведущий", "VK ID", "CW ID участника", "Имя",
     "Пришёл", "Ушёл", "Минут", "Баллы", "Самостоятельный уход", "Записано",
+]
+FREE_HEADERS = [
+    "Ключ", "Дата", "Беседа", "VK ID", "CW ID участника", "Имя", "Пришёл", "Ушёл", "Минут", "Баллы",
+    "Вычет, мин", "Пометка", "Записано",
 ]
 MEMBERS_TTL = 300  # сколько секунд хранить прочитанный лист «Участники»
 
@@ -475,6 +481,50 @@ def write_training(training: dict) -> dict:
     return result
 
 
+@_wrap
+def write_free_run(training: dict) -> dict:
+    """
+    Записывает забег свободного бега на лист «Свободный бег» (SHEET_FREE_RUN): по строке на участника.
+    Формат training: key, start, end, chat_id, chat_title, participants[{vk_id, cw_id, name, join, leave,
+    minutes, points, deduct, note}]. Повторный вызов с тем же ключом дубликатов не создаёт.
+    """
+    ws, head = _ensure_ws(os.getenv("SHEET_FREE_RUN", "Свободный бег"), FREE_HEADERS)
+    key = training["key"]
+    if not training["participants"] or key in set(_retry(ws.col_values, head.index("Ключ") + 1)):
+        return {"participants_written": 0}
+    now = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
+    rows = [
+        _row(head, {
+            "Ключ": key, "Дата": _d(p["join"]), "Беседа": training["chat_title"], "VK ID": p["vk_id"] or "",
+            "CW ID участника": p.get("cw_id", ""), "Имя": p["name"], "Пришёл": _dt(p["join"]),
+            "Ушёл": _dt(p["leave"]), "Минут": int(p["minutes"]), "Баллы": float(p["points"]),
+            "Вычет, мин": int(p.get("deduct", 0)), "Пометка": p.get("note", ""), "Записано": now,
+        })
+        for p in training["participants"]
+    ]
+    _retry(ws.append_rows, rows, value_input_option="RAW")
+    return {"participants_written": len(rows)}
+
+
+@_wrap
+def read_free_run(date_from: date = None, date_to: date = None):
+    """Строки листа «Свободный бег» за период (по дате прихода)."""
+    out = []
+    for r in _records(os.getenv("SHEET_FREE_RUN", "Свободный бег"), FREE_HEADERS):
+        d = _parse_date(r.get("Дата", ""))
+        if not _in_range(d, date_from, date_to):
+            continue
+        out.append({
+            "key": r.get("Ключ", ""), "date": d, "chat_title": r.get("Беседа", ""),
+            "vk_id": int(_num(r.get("VK ID", ""))) if str(r.get("VK ID", "")).strip() else None,
+            "cw_id": _int_or_text(r.get("CW ID участника", "")), "name": r.get("Имя", ""),
+            "join": _parse_dt(r.get("Пришёл", "")), "leave": _parse_dt(r.get("Ушёл", "")),
+            "minutes": int(_num(r.get("Минут", ""))), "points": _num(r.get("Баллы", "")),
+            "deduct": int(_num(r.get("Вычет, мин", ""))), "note": r.get("Пометка", ""),
+        })
+    return out
+
+
 # ───────────────────────── чтение ─────────────────────────
 def _records(ws_name: str, headers):
     ws, _ = _ensure_ws(ws_name, headers)
@@ -576,6 +626,7 @@ def check_connection() -> dict:
     sh = _spreadsheet()
     _ensure_ws(ws_tr, TRAININGS_HEADERS)
     _ensure_ws(ws_p, PARTS_HEADERS)
+    _ensure_ws(os.getenv("SHEET_FREE_RUN", "Свободный бег"), FREE_HEADERS)
     try:
         info = _credentials_info()
         email = info["client_email"] if info else json.load(open(creds, encoding="utf-8")).get("client_email")

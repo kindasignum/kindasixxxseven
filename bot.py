@@ -22,6 +22,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import vk_api
+
+import freerun
 from vk_api.bot_longpoll import VkBotEventType, VkBotLongPoll
 from vk_api.exceptions import ApiError
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
@@ -47,6 +49,12 @@ JOIN_TOLERANCE_SEC = 6 * 3600  # насколько раньше старта д
 EDIT_POLL_SEC = int(os.getenv("EDIT_POLL_SEC", "20"))
 # 1 — писать в лог тип каждого полученного события (для диагностики Long Poll)
 LOG_EVENTS = os.getenv("LOG_EVENTS", "0") == "1"
+# свободный бег: 1 — только разбирать отписи и писать в лог (ничего не считать и не отправлять)
+FREE_RUN_SHADOW = os.getenv("FREE_RUN_SHADOW", "0") == "1"
+# через сколько секунд после последней отписи (когда все ушли) забег закрывается и уходит отчёт админам
+FREE_RUN_GRACE_SEC = int(os.getenv("FREE_RUN_GRACE_SEC", str(20 * 60)))
+# если за это время не отписали уход — участник закрывается с пометкой «нет ухода» (8 часов)
+FREE_RUN_MAX_SEC = int(os.getenv("FREE_RUN_MAX_SEC", str(8 * 3600)))
 # новые беседы по умолчанию включены (0 — выключены до команды «N вкл»)
 DEFAULT_CHAT_ENABLED = int(os.getenv("DEFAULT_CHAT_ENABLED", "1"))
 # запасной список админов сообщества (если VK не отдаёт список): VK ID через запятую
@@ -159,6 +167,11 @@ def ensure_column(table: str, col: str, ddl: str):
 ensure_column("chats", "self_gov_days", "TEXT NOT NULL DEFAULT ''")
 ensure_column("reports", "note", "TEXT")
 ensure_column("reports", "page", "INTEGER NOT NULL DEFAULT 0")
+ensure_column("participants", "deduct", "INTEGER NOT NULL DEFAULT 0")  # вычет минут по отписи (свободный бег)
+ensure_column("participants", "deduct_cmid", "INTEGER")
+ensure_column("participants", "flag", "TEXT")  # пометки для администратора
+ensure_column("participants", "src", "TEXT")   # текст отписи, по которой записан участник
+ensure_column("trainings", "touch_ts", "INTEGER")  # свободный бег: когда была последняя отпись
 ensure_column("trainings", "kind", "TEXT NOT NULL DEFAULT 'group'")  # group | individual
 db.execute(
     "CREATE TABLE IF NOT EXISTS menu_state("
@@ -227,8 +240,19 @@ def fmt_dur(minutes: int) -> str:
     return f"{m} минут"
 
 
+def calc_free_points(minutes: int) -> float:
+    """Свободный бег: <25 мин — 0; 25–49 — 0,5; 50–104 — 1; 105–134 — 1,5; затем +0,5 за каждые 30 минут."""
+    if minutes < 25:
+        return 0.0
+    if minutes < 50:
+        return 0.5
+    if minutes < 105:
+        return 1.0
+    return 1.5 + ((minutes - 105) // 30) * 0.5
+
+
 def minutes_of(p) -> int:
-    return max(0, (p["leave_ts"] - p["join_ts"]) // 60)
+    return max(0, (p["leave_ts"] - p["join_ts"]) // 60 - (p["deduct"] or 0))
 
 
 def fmt_t(ts: int, start_ts: int) -> str:
@@ -472,6 +496,8 @@ def trainer_rows(tid: int):
 
 def ensure_trainers(t):
     """Тренировки, начатые старой версией бота: единственный тренер — тот, кто написал /старт."""
+    if t["kind"] == "free_run":
+        return  # в свободном беге тренеров нет
     if db.execute("SELECT 1 FROM trainers WHERE training_id=?", (t["id"],)).fetchone():
         return
     db.execute(
@@ -509,6 +535,23 @@ def training_chat_title(t) -> str:
     return "Индивидуальная тренировка" if t["kind"] == "individual" else chat_title(t["peer_id"])
 
 
+def build_free_run_payload(t, members) -> dict:
+    """Данные забега для sheets.write_free_run(): у каждого участника свои время прихода и ухода."""
+    parts = []
+    for p in db.execute("SELECT * FROM participants WHERE training_id=? ORDER BY num", (t["id"],)):
+        mins = minutes_of(p)
+        rec = members.participant(p["name"], p["vk_id"]) if members else None
+        parts.append({
+            "vk_id": p["vk_id"], "cw_id": rec["cw_id"] if rec else "",
+            "name": (rec["name"] if rec and rec["name"] else p["name"]),
+            "join": dt(p["join_ts"]), "leave": dt(p["leave_ts"]), "minutes": mins,
+            "points": calc_free_points(mins), "deduct": p["deduct"] or 0, "note": p["flag"] or "",
+        })
+    return {"key": f"fr-{t['peer_id']}-{t['start_ts']}-{t['id']}", "start": dt(t["start_ts"]),
+            "end": dt(t["end_ts"]), "chat_id": t["peer_id"] - 2_000_000_000,
+            "chat_title": chat_title(t["peer_id"]), "participants": parts}
+
+
 def build_training_payload(training_id: int) -> dict:
     """
     Данные тренировки для sheets.write_training(). CW ID тренера берётся с листа «Участники»
@@ -517,6 +560,8 @@ def build_training_payload(training_id: int) -> dict:
     """
     t = db.execute("SELECT * FROM trainings WHERE id=?", (training_id,)).fetchone()
     members = get_members()
+    if t["kind"] == "free_run":
+        return build_free_run_payload(t, members)
     ensure_trainers(t)
     trs = trainer_rows(training_id)
     views = [(r, *trainer_view(r, members)) for r in trs]
@@ -560,7 +605,9 @@ def write_to_google_sheet(training_id: int) -> bool:
         log.error("Модуль sheets.py недоступен: %s", e)
         return False
     try:
-        res = sheets.write_training(build_training_payload(training_id))
+        payload = build_training_payload(training_id)
+        kind = db.execute("SELECT kind FROM trainings WHERE id=?", (training_id,)).fetchone()["kind"]
+        res = sheets.write_free_run(payload) if kind == "free_run" else sheets.write_training(payload)
         log.info("Запись в таблицу, тренировка %s: %s", training_id, res)
         return True
     except sheets.SheetsError as e:
@@ -587,12 +634,26 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
     unmatched = []
     trainer_warn = [False]
 
+    fr = t["kind"] == "free_run"
+
     def line(p):
         m = minutes_of(p)
         warn = ""
         if members and not members.participant(p["name"], p["vk_id"]):
             warn = " ⚠"
             unmatched.append(p["num"])
+        if fr:
+            ded = f" (с вычетом {p['deduct']} мин)" if p["deduct"] else ""
+            res = (f"{p['num']}. {who(p)}{warn} {fmt_t(p['join_ts'], t['start_ts'])} - "
+                   f"{fmt_t(p['leave_ts'], t['start_ts'])}, {fmt_dur(m)}{ded}, "
+                   f"{fmt_points(calc_free_points(m))} б.")
+            if m < 25:
+                res += " (меньше 25 минут — не засчитывается)"
+            if p["flag"]:
+                res += f"\n    ⚠ {p['flag']}"
+            if p["src"]:
+                res += f"\n    «{p['src'][:150]}»"
+            return res
         return (
             f"{p['num']}. {who(p)}{warn} {fmt_t(p['join_ts'], t['start_ts'])} - "
             f"{fmt_t(p['leave_ts'], t['start_ts'])}, "
@@ -601,10 +662,10 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
 
     d_part, t_part = training_label(t)
     indiv = t["kind"] == "individual"
-    head = ("Индивидуальная тренировка " if indiv else "Тренировка ") + f"{d_part}. {t_part}"
+    head = ("Свободный бег " if fr else "Индивидуальная тренировка " if indiv else "Тренировка ") + f"{d_part}. {t_part}"
     # «Участники» — кто не уходил раньше конца тренировки; «Ушли досрочно» — остальные
-    stayed = [line(p) for p in parts if p["leave_ts"] >= t["end_ts"]]
-    early = [line(p) for p in parts if p["leave_ts"] < t["end_ts"]]
+    stayed = [line(p) for p in parts if fr or p["leave_ts"] >= t["end_ts"]]
+    early = [line(p) for p in parts if not fr and p["leave_ts"] < t["end_ts"]]
 
     trs = trainer_rows(tid)
     views = [(r, *trainer_view(r, members)) for r in trs]
@@ -631,8 +692,7 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
         head,
         *([] if indiv else [f"Беседа: {chat_title(t['peer_id'])}"]),
         "",
-        *trainer_lines,
-        "",
+        *([] if fr else [*trainer_lines, ""]),
         "Участники:",
         *(stayed or ["—"]),
     ]
@@ -702,8 +762,9 @@ def confirm_kb(tid: int, page: int = 0) -> str:
     if page < pages - 1:
         kb.add_callback_button("▶", sec, payload={"cmd": "rp_page", "tid": tid, "pg": page + 1})
     kb.add_line()
-    kb.add_callback_button("Изменить время тренировки", sec, payload={"cmd": "rp_time", "tid": tid})
-    kb.add_line()
+    if not db.execute("SELECT 1 FROM trainings WHERE id=? AND kind='free_run'", (tid,)).fetchone():
+        kb.add_callback_button("Изменить время тренировки", sec, payload={"cmd": "rp_time", "tid": tid})
+        kb.add_line()
     kb.add_callback_button(
         "Подтвердить", VkKeyboardColor.POSITIVE, payload={"cmd": "confirm", "tid": tid}
     )
@@ -753,6 +814,12 @@ def dispatch_report(tid: int):
       • если тренерам доставить нельзя — резервно администраторам сообщества (подтвердить может любой из них).
     """
     t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
+    if t["kind"] == "free_run":  # тренеров нет: отчёт получают все администраторы сообщества
+        note = ("Свободный бег: отчёт отправлен всем администраторам сообщества, "
+                "подтвердить может любой из вас.")
+        if not deliver_report(tid, sorted(group_admin_ids()), note):
+            log.error("Отчёт по свободному бегу %s не удалось доставить никому", tid)
+        return
     ensure_trainers(t)
     chat = get_chat(t["peer_id"])
     trainers = [r["vk_id"] for r in trainer_rows(tid) if r["vk_id"] and r["vk_id"] > 0]
@@ -807,8 +874,21 @@ def update_report(rep):
     send_report_message(tid, uid, rep["note"])  # новое сообщение становится «исходным»
 
 
+def refresh_run_bounds(tid: int):
+    """Свободный бег: границы забега = от первого прихода до последнего ухода (после правок времени)."""
+    t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
+    if not t or t["kind"] != "free_run" or t["status"] == "run":
+        return
+    r = db.execute("SELECT MIN(join_ts) a, MAX(COALESCE(leave_ts, join_ts)) b FROM participants "
+                   "WHERE training_id=?", (tid,)).fetchone()
+    if r["a"] is not None:
+        db.execute("UPDATE trainings SET start_ts=?, end_ts=? WHERE id=?", (r["a"], r["b"], tid))
+        db.commit()
+
+
 def update_all_reports(tid: int):
     """После правок отчёта обновляет сообщения у ВСЕХ получателей (тренеров / администраторов)."""
+    refresh_run_bounds(tid)
     for rep in latest_reports(tid):
         update_report(rep)
 
@@ -1089,7 +1169,7 @@ def is_command_like(text: str) -> bool:
 
 def worth_watching(text: str) -> bool:
     """Стоит ли перечитывать нераспознанное сообщение: похоже на неудавшуюся команду."""
-    return (text.startswith(("#", "/")) or bool(re.search(r"(?<![\w#])#(?:лапа|уход)(?!\w)", text, re.I))
+    return (text.startswith(("#", "/")) or bool(re.search(r"(?<![\w#])#(?:лапа|уход|бег)(?!\w)", text, re.I))
             or bool(re.match(r"\+\s*т", text, re.I)))
 
 
@@ -1117,9 +1197,8 @@ def handle_chat(msg: dict):
     chat = get_chat(peer)
     if not chat or not chat["enabled"]:
         return  # беседа отключена в /настройка — бот её игнорирует
-    # TODO (свободный бег): if chat["free_run"]: ... — доработаем позже
     ensure_admin(peer)
-    effect = process_chat_command(peer, chat, uid, cmid, text, floor_min(msg["date"]), edited=False)
+    effect = run_chat_command(peer, chat, uid, cmid, text, floor_min(msg["date"]), edited=False)
     log_message(peer, uid, cmid, msg["date"], text, effect)
 
 
@@ -1149,7 +1228,7 @@ def handle_chat_edit(msg: dict, source: str = "событие") -> bool:
     if not chat or not chat["enabled"]:
         log.info("%s — пропущена: беседа отключена в /настройка", tag)
         return False
-    effect = process_chat_command(peer, chat, uid, cmid, text, floor_min(date), edited=True)
+    effect = run_chat_command(peer, chat, uid, cmid, text, floor_min(date), edited=True)
     log_message(peer, uid, cmid, date, text, effect)
     log.info("%s — %s", tag, "команда отработана" if effect else "команды нет или она ничего не дала")
     return effect
@@ -1191,6 +1270,213 @@ def poll_watched_messages():
     db.commit()
 
 
+# ───────────────────────── свободный бег ─────────────────────────
+def open_run(peer: int):
+    return db.execute("SELECT * FROM trainings WHERE peer_id=? AND kind='free_run' AND status='run' "
+                      "ORDER BY id DESC LIMIT 1", (peer,)).fetchone()
+
+
+def new_run(peer: int, start_ts: int, now: int):
+    cur = db.execute("INSERT INTO trainings(peer_id,leader_id,start_ts,status,kind,touch_ts) "
+                     "VALUES(?,?,?,'run','free_run',?)", (peer, 0, start_ts, now))
+    db.commit()
+    return db.execute("SELECT * FROM trainings WHERE id=?", (cur.lastrowid,)).fetchone()
+
+
+def find_open_row(run, name: str, vk_id):
+    for r in db.execute("SELECT * FROM participants WHERE training_id=? AND leave_ts IS NULL", (run["id"],)):
+        if name_key(r["name"]) == name_key(name) or (vk_id and r["vk_id"] == vk_id):
+            return r
+    return None
+
+
+def find_closed_row(run, name: str, vk_id):
+    for r in db.execute("SELECT * FROM participants WHERE training_id=? AND leave_ts IS NOT NULL ORDER BY id DESC",
+                        (run["id"],)):
+        if name_key(r["name"]) == name_key(name) or (vk_id and r["vk_id"] == vk_id):
+            return r
+    return None
+
+
+def add_flags(pid: int, flags, src: str = None):
+    """Дописывает пометки (без повторов) и текст отписи к участнику."""
+    r = db.execute("SELECT flag FROM participants WHERE id=?", (pid,)).fetchone()
+    cur = [x for x in (r["flag"] or "").split("; ") if x]
+    for f in flags:
+        if f not in cur:
+            cur.append(f)
+    db.execute("UPDATE participants SET flag=?, src=COALESCE(?, src) WHERE id=?",
+               ("; ".join(cur) or None, src if cur else None, pid))
+
+
+def author_info(uid: int, members) -> dict:
+    rec = members.trainer(uid) if members else None
+    if rec and rec["name"]:
+        return {"vk_id": uid, "name": rec["name"], "known": True}
+    return {"vk_id": uid, "name": norm_name(user_name(uid)), "known": False}
+
+
+def apply_free_run_person(peer: int, cmid, seg: str, pr: dict, P: dict, ts: int, now: int) -> bool:
+    name, vk_id = P["name"], P.get("vk_id")
+    flags = list(pr["flags"]) + list(P.get("flags", []))
+    in_ts = pr["in_ts"] if pr["in_ts"] is not None else ts
+    out_ts = pr["out_ts"] if pr["out_ts"] is not None else ts
+    run = open_run(peer)
+    row = find_open_row(run, name, vk_id) if run else None
+    pid = row["id"] if row else None
+    if pr["deduct"] and not (pr["has_in"] or pr["has_out"]):
+        return apply_deduct_only(peer, cmid, seg, pr, P, flags, now)
+
+    def insert(join_ts):
+        nonlocal run
+        run = run or new_run(peer, join_ts, now)
+        if join_ts < run["start_ts"]:
+            db.execute("UPDATE trainings SET start_ts=? WHERE id=?", (join_ts, run["id"]))
+        cur = db.execute("INSERT INTO participants(training_id,num,vk_id,name,join_ts,join_cmid) VALUES(?,?,?,?,?,?)",
+                         (run["id"], next_num(run["id"]), vk_id, name, join_ts, cmid))
+        return cur.lastrowid
+
+    if pr["has_in"]:
+        if pid:
+            flags.append("повторный приход: участник уже отмечен в забеге")
+        else:
+            pid = insert(in_ts)
+    if pr["has_out"]:
+        if pid is None:
+            closed = find_closed_row(run, name, vk_id) if run and not pr["has_in"] else None
+            if closed:  # уход уже был отписан — не создаём пустую запись, только помечаем
+                add_flags(closed["id"], ["повторный уход: участник уже отмечен ушедшим"], seg[:200])
+                db.commit()
+                return True
+            pid = insert(out_ts)
+            flags.append("нет прихода — укажите время начала")
+        r = db.execute("SELECT * FROM participants WHERE id=?", (pid,)).fetchone()
+        if out_ts < r["join_ts"]:
+            flags.append("время ухода раньше времени прихода")
+        db.execute("UPDATE participants SET leave_ts=?, leave_cmid=?, auto_leave=0 WHERE id=?",
+                   (max(out_ts, r["join_ts"]), cmid, pid))
+    if pr["deduct"]:
+        db.execute("UPDATE participants SET deduct=?, deduct_cmid=? WHERE id=?", (pr["deduct"], cmid, pid))
+    add_flags(pid, flags, seg[:200])
+    run_id = db.execute("SELECT training_id FROM participants WHERE id=?", (pid,)).fetchone()[0]
+    db.execute("UPDATE trainings SET touch_ts=? WHERE id=?", (now, run_id))
+    db.commit()
+    return True
+
+
+def apply_deduct_only(peer: int, cmid, seg: str, pr: dict, P: dict, flags, now: int) -> bool:
+    """«вычтите мне 15 минут» без прихода/ухода: вычет у последней записи человека за 12 часов."""
+    rows = db.execute(
+        "SELECT p.*, t.status AS tstatus FROM participants p JOIN trainings t ON t.id=p.training_id "
+        "WHERE t.peer_id=? AND t.kind='free_run' AND t.status IN ('run','finished') AND p.join_ts>? "
+        "ORDER BY p.id DESC", (peer, now - 12 * 3600)).fetchall()
+    for r in rows:
+        if name_key(r["name"]) == name_key(P["name"]) or (P.get("vk_id") and r["vk_id"] == P["vk_id"]):
+            db.execute("UPDATE participants SET deduct=?, deduct_cmid=? WHERE id=?", (pr["deduct"], cmid, r["id"]))
+            add_flags(r["id"], flags, seg[:200])
+            db.commit()
+            if r["tstatus"] == "finished":
+                update_all_reports(r["training_id"])
+            return True
+    return False
+
+
+def apply_free_run(peer: int, cmid, seg: str, pr: dict, ts: int, now: int) -> bool:
+    if not (pr["has_in"] or pr["has_out"] or pr["deduct"]):
+        return False
+    people = pr["people"]
+    if pr["all"]:  # «все ушли» — все, кто сейчас в забеге
+        run = open_run(peer)
+        people = [{"name": r["name"], "vk_id": r["vk_id"], "flags": []} for r in db.execute(
+            "SELECT * FROM participants WHERE training_id=? AND leave_ts IS NULL", (run["id"],))] if run else []
+        pr = dict(pr, has_in=False)
+    effect = False
+    for P in people:
+        effect = apply_free_run_person(peer, cmid, seg, pr, P, ts, now) or effect
+    return effect
+
+
+def free_run_undo(peer: int, cmid) -> bool:
+    """Исправили сообщение: снимаем его прежние действия в ещё не закрытом забеге. False — забег уже отправлен."""
+    rows = db.execute(
+        "SELECT p.*, t.status AS tstatus FROM participants p JOIN trainings t ON t.id=p.training_id "
+        "WHERE t.peer_id=? AND t.kind='free_run' AND (p.join_cmid=? OR p.leave_cmid=? OR p.deduct_cmid=?)",
+        (peer, cmid, cmid, cmid)).fetchall()
+    if any(r["tstatus"] != "run" for r in rows):
+        return False
+    for r in rows:
+        if r["join_cmid"] == cmid:
+            db.execute("DELETE FROM participants WHERE id=?", (r["id"],))
+            continue
+        if r["leave_cmid"] == cmid:
+            db.execute("UPDATE participants SET leave_ts=NULL, leave_cmid=NULL WHERE id=?", (r["id"],))
+        if r["deduct_cmid"] == cmid:
+            db.execute("UPDATE participants SET deduct=0, deduct_cmid=NULL WHERE id=?", (r["id"],))
+        db.execute("UPDATE participants SET flag=NULL, src=NULL WHERE id=?", (r["id"],))
+    db.commit()
+    return True
+
+
+def process_free_run(peer: int, chat, uid: int, cmid, text: str, ts: int, edited: bool = False) -> bool:
+    """#бег в беседе со свободным бегом. True — понято (или осознанно пропущено); False — не поняли (❓)."""
+    segs = freerun.segments(text)
+    if not segs:
+        return False
+    members = get_members()
+    if edited and not FREE_RUN_SHADOW and not free_run_undo(peer, cmid):
+        return True  # забег уже отправлен администраторам — правки только кнопками отчёта
+    author = author_info(uid, members)
+    now, effect = int(time.time()), False
+    for seg in segs:
+        pr = freerun.parse(seg, ts, members, author)
+        log.info("Свободный бег, беседа %s, сообщение %s: %r → люди=%s приход=%s уход=%s все=%s вычет=%s пометки=%s",
+                 peer, cmid, seg[:80], [p["name"] for p in pr["people"]], pr["has_in"], pr["has_out"],
+                 pr["all"], pr["deduct"], pr["flags"])
+        if not FREE_RUN_SHADOW:
+            effect = apply_free_run(peer, cmid, seg, pr, ts, now) or effect
+    if FREE_RUN_SHADOW:
+        return True
+    react(peer, cmid, "check" if effect else "question")
+    return effect
+
+
+def finalize_free_run(t):
+    tid = t["id"]
+    r = db.execute("SELECT MIN(join_ts) a, MAX(COALESCE(leave_ts, join_ts)) b, COUNT(*) n FROM participants "
+                   "WHERE training_id=?", (tid,)).fetchone()
+    if not r["n"]:
+        db.execute("DELETE FROM trainings WHERE id=?", (tid,))
+        db.commit()
+        return
+    db.execute("UPDATE trainings SET status='finished', start_ts=?, end_ts=? WHERE id=?", (r["a"], r["b"], tid))
+    db.commit()
+    chat_title(t["peer_id"], refresh=True)
+    autocorrect_participants(tid)
+    dispatch_report(tid)
+
+
+def free_run_tick():
+    """Раз в минуту: закрывает «забытые» уходы (8 ч) и отправляет отчёт по забегам, где все ушли и тихо."""
+    now = int(time.time())
+    for t in db.execute("SELECT * FROM trainings WHERE kind='free_run' AND status='run'").fetchall():
+        for p in db.execute("SELECT * FROM participants WHERE training_id=? AND leave_ts IS NULL AND join_ts<?",
+                            (t["id"], now - FREE_RUN_MAX_SEC)).fetchall():
+            db.execute("UPDATE participants SET leave_ts=join_ts, auto_leave=1 WHERE id=?", (p["id"],))
+            add_flags(p["id"], [f"нет ухода за {FREE_RUN_MAX_SEC // 3600} ч — укажите время ухода"])
+            db.execute("UPDATE trainings SET touch_ts=? WHERE id=?", (now, t["id"]))
+        db.commit()
+        left = db.execute("SELECT COUNT(*) FROM participants WHERE training_id=? AND leave_ts IS NULL",
+                          (t["id"],)).fetchone()[0]
+        if left == 0 and now - (t["touch_ts"] or now) >= FREE_RUN_GRACE_SEC:
+            finalize_free_run(t)
+
+
+def run_chat_command(peer: int, chat, uid: int, cmid, text: str, ts: int, edited: bool) -> bool:
+    if chat["free_run"] and freerun.RE_RUN.search(text):
+        return process_free_run(peer, chat, uid, cmid, text, ts, edited)
+    return process_chat_command(peer, chat, uid, cmid, text, ts, edited=edited)
+
+
 # ───────────────────────── правки в ЛС ─────────────────────────
 class EditError(Exception):
     pass
@@ -1223,9 +1509,11 @@ def _span(t, h1, m1, h2, m2):
     Приход — первое такое время не раньше (старт − 6 ч); уход — первое такое время после прихода.
     """
     start, end = t["start_ts"], t["end_ts"]
-    j = next((c for c in _candidates(start, h1, m1) if c >= start - JOIN_TOLERANCE_SEC), None)
+    fr = t["kind"] == "free_run"  # у свободного бега у каждого своё время: допуск шире
+    tol = 12 * 3600 if fr else JOIN_TOLERANCE_SEC
+    j = next((c for c in _candidates(start, h1, m1) if c >= start - tol), None)
     l = next((c for c in _candidates(start, h2, m2) if j is not None and c > j), None)
-    if j is None or l is None or j > end or l > end + JOIN_TOLERANCE_SEC:
+    if j is None or l is None or j > end + (tol if fr else 0) or l > end + tol:
         raise EditError("время вне тренировки")
     return j, l
 
@@ -1250,6 +1538,8 @@ def apply_edits(tid: int, lines):
     members = get_members()  # до транзакции: может обращаться к Google Таблице
     with db:  # атомарно: при ошибке откат всех строк
         for ln in lines:
+            if t["kind"] == "free_run" and re.match(r"^[+\-]?\s*тренер", ln, re.I):
+                raise EditError("в свободном беге нет тренеров")
             m = RE_T_RENAME.match(ln)
             if m:
                 name = norm_name(m.group(2))
@@ -1401,6 +1691,12 @@ def entry_kb(tid: int, k: str, n: int) -> str:
     return kb.get_keyboard()
 
 
+ADD_TEXT_FR = (
+    "Добавление включено: я слушаю новые сообщения. Отправь ответным сообщением (можно несколько строк):\n\n"
+    "Имя 15:00-16:30 — добавить участника\n\n"
+    "Время можно не указывать — тогда человек будет записан на весь забег. "
+    "Чтобы закончить, нажми «Вернуться»."
+)
 ADD_TEXT = (
     "Добавление включено: я слушаю новые сообщения. Отправь ответным сообщением (можно несколько строк):\n\n"
     "Имя 15:00-16:30 — добавить участника\n"
@@ -2158,7 +2454,8 @@ def handle_report_event(obj: dict):
         elif cmd == "rp_add":
             kb = VkKeyboard(inline=True)
             kb.add_callback_button("Вернуться", VkKeyboardColor.SECONDARY, payload={"cmd": "rp_back"})
-            open_session(uid, tid, "add", None, ADD_TEXT, kb.get_keyboard())
+            open_session(uid, tid, "add", None, ADD_TEXT_FR if t["kind"] == "free_run" else ADD_TEXT,
+                         kb.get_keyboard())
         elif cmd == "rp_del":
             ensure_trainers(t)
             if k == "t":
@@ -2295,10 +2592,16 @@ def main():
             lp = VkBotLongPoll(vk_session, GROUP_ID, wait=10)
             log.info("Бот запущен (опрос правок: %s)",
                      f"каждые {EDIT_POLL_SEC} с" if EDIT_POLL_SEC > 0 else "выключен")
-            last_poll = 0.0
+            last_poll = last_tick = 0.0
             while True:
                 for event in lp.check():
                     dispatch_event(event)
+                if time.time() - last_tick >= 60:
+                    last_tick = time.time()
+                    try:
+                        free_run_tick()
+                    except Exception:
+                        log.exception("Ошибка учёта свободного бега")
                 if EDIT_POLL_SEC > 0 and time.time() - last_poll >= EDIT_POLL_SEC:
                     last_poll = time.time()
                     try:

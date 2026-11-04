@@ -10,7 +10,8 @@ CREATE TABLE IF NOT EXISTS trainings(
     end_ts      INTEGER,                           -- unix-время окончания
     status      TEXT NOT NULL DEFAULT 'active',    -- active | finished | confirmed
     start_cmid  INTEGER,                           -- номер сообщения /старт в беседе
-    kind        TEXT NOT NULL DEFAULT 'group'      -- group — в беседе; individual — индивидуальная (peer_id = VK ID модератора)
+    kind        TEXT NOT NULL DEFAULT 'group',     -- group — в беседе; individual — индивидуальная (peer_id = VK ID модератора); free_run — забег свободного бега
+    touch_ts    INTEGER                            -- свободный бег: когда была последняя отпись (status = 'run' — забег идёт)
 );
 
 CREATE TABLE IF NOT EXISTS participants(
@@ -23,7 +24,11 @@ CREATE TABLE IF NOT EXISTS participants(
     leave_ts    INTEGER,
     join_cmid   INTEGER,                           -- сообщение #лапа
     leave_cmid  INTEGER,                           -- сообщение #уход
-    auto_leave  INTEGER NOT NULL DEFAULT 0         -- 1 = ушёл по /стоп
+    auto_leave  INTEGER NOT NULL DEFAULT 0,        -- 1 = ушёл по /стоп
+    deduct      INTEGER NOT NULL DEFAULT 0,        -- свободный бег: вычет минут по отписи участника
+    deduct_cmid INTEGER,                           -- сообщение, в котором просили вычесть
+    flag        TEXT,                              -- свободный бег: пометки для администратора («; » между ними)
+    src         TEXT                               -- свободный бег: текст отписи, по которой записан участник
 );
 
 CREATE TABLE IF NOT EXISTS reports(
@@ -109,3 +114,8 @@ CREATE TABLE IF NOT EXISTS menu_state(
 --   ALTER TABLE reports ADD COLUMN note TEXT;                                -- пояснение вверху отчёта
 --   ALTER TABLE reports ADD COLUMN page INTEGER NOT NULL DEFAULT 0;          -- страница кнопок правок
 --   ALTER TABLE trainings ADD COLUMN kind TEXT NOT NULL DEFAULT 'group';     -- group | individual
+--   ALTER TABLE trainings   ADD COLUMN touch_ts INTEGER;
+--   ALTER TABLE participants ADD COLUMN deduct INTEGER NOT NULL DEFAULT 0;
+--   ALTER TABLE participants ADD COLUMN deduct_cmid INTEGER;
+--   ALTER TABLE participants ADD COLUMN flag TEXT;
+--   ALTER TABLE participants ADD COLUMN src TEXT;
