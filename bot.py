@@ -94,7 +94,7 @@ CREATE TABLE IF NOT EXISTS trainings(
     stopper_id INTEGER,              -- кто написал /стоп
     start_ts INTEGER NOT NULL,
     end_ts INTEGER,
-    status TEXT NOT NULL DEFAULT 'active',  -- active | finished | confirmed
+    status TEXT NOT NULL DEFAULT 'active',  -- active | finished | confirmed | rejected
     start_cmid INTEGER
 );
 CREATE TABLE IF NOT EXISTS participants(
@@ -621,13 +621,47 @@ def write_to_google_sheet(training_id: int) -> bool:
 
 
 # ───────────────────────── отчёт ─────────────────────────
-REPORT_HELP = "Если что-то неверно, исправь отчёт кнопками ниже. Когда всё будет верно, нажми «Подтвердить»."
+REPORT_HELP = ("Если что-то неверно, исправь отчёт кнопками ниже. Когда всё будет верно, нажми «Подтвердить». "
+               "«Отклонить» — отчёт не будет записан в таблицу.")
+
+# Пометки свободного бега делятся на группы (порядок = порядок вывода). Первая группа — то, что обязательно
+# должен проверить администратор; остальные — автоматические исправления бота, о которых он сообщает.
+FLAG_ORDER = (
+    ("manual", "🚨", "Требует правки",
+     re.compile(r"укажите|проверьте|неоднозначно|раньше времени прихода|несуществующее|не понятно, к чему|"
+                r"не применил|имя не указано", re.I)),
+    ("name", "🔤", "Имя / написание", re.compile(r"распознано как|раскладк|выбрано по недавним", re.I)),
+    ("time", "🕒", "Время", re.compile(r"^время|минут назад|сдвинуто|^«через", re.I)),
+    ("deduct", "➖", "Вычет", re.compile(r"^вычет", re.I)),
+    ("other", "ℹ️", "На заметку", None),
+)
+FLAG_LEGEND = {
+    "manual": "🚨 — нужна ручная правка администратора",
+    "name": "🔤 — имя или слово исправлено автоматически",
+    "time": "🕒 — время понято/пересчитано автоматически",
+    "deduct": "➖ — вычет минут по отписи",
+    "other": "ℹ️ — на заметку",
+}
 
 
-def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
+def render_flags(flag_text: str):
+    """Пометки участника → (строки отчёта по группам, есть ли требующие ручной правки, множество групп)."""
+    buckets = {}
+    for f in (x.strip() for x in (flag_text or "").split("; ")):
+        if not f:
+            continue
+        key = next((g[0] for g in FLAG_ORDER if g[3] is not None and g[3].search(f)), "other")
+        buckets.setdefault(key, []).append(f)
+    lines = [f"{emoji} {label}: {'; '.join(buckets[key])}"
+             for key, emoji, label, _ in FLAG_ORDER if key in buckets]
+    return lines, "manual" in buckets, set(buckets)
+
+
+def render_report(tid: int, note: str = None, confirmed_by: str = None, rejected_by: str = None) -> str:
     """
     note — пояснение, почему отчёт пришёл именно этому получателю;
-    confirmed_by — ссылка на того, кто подтвердил запись (дописывается вверху).
+    confirmed_by — ссылка на того, кто подтвердил запись (дописывается вверху);
+    rejected_by — ссылка на того, кто отклонил отчёт (дописывается вверху).
     """
     t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
     ensure_trainers(t)
@@ -638,15 +672,18 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
     members = get_members()
     unmatched = []
     trainer_warn = [False]
+    manual_nums, used_groups = set(), set()  # свободный бег: кому нужна ручная правка / какие группы пометок были
 
     fr = t["kind"] == "free_run"
+    mark = "🚨" if fr else "⚠"
 
     def line(p):
         m = minutes_of(p)
         warn = ""
         if members and not members.participant(p["name"], p["vk_id"]):
-            warn = " ⚠"
+            warn = f" {mark}"
             unmatched.append(p["num"])
+            manual_nums.add(p["num"])
         if fr:
             ded = f" (с вычетом {p['deduct']} мин)" if p["deduct"] else ""
             res = (f"{p['num']}. {who(p)}{warn} {fmt_t(p['join_ts'], t['start_ts'])} - "
@@ -655,7 +692,11 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
             if m < 25:
                 res += " (меньше 25 минут — не засчитывается)"
             if p["flag"]:
-                res += f"\n    ⚠ {p['flag']}"
+                fl_lines, fl_manual, fl_groups = render_flags(p["flag"])
+                res += "".join("\n    " + x for x in fl_lines)
+                used_groups.update(fl_groups)
+                if fl_manual:
+                    manual_nums.add(p["num"])
             if p["src"]:
                 res += f"\n    «{p['src'][:150]}»"
             return res
@@ -691,8 +732,12 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
     out = []
     if confirmed_by:
         out += [f"✔ Запись подтвердил(а): {confirmed_by}", ""]
+    if rejected_by:
+        out += [f"✖ Отчёт отклонил(а): {rejected_by} — в таблицу не записан", ""]
     if note:
         out += [f"ℹ {note}", ""]
+    if fr and manual_nums and not (confirmed_by or rejected_by):
+        out += ["🚨 Требуют ручной проверки: " + ", ".join(f"№{n}" for n in sorted(manual_nums)), ""]
     out += [
         head,
         *([] if indiv else [f"Беседа: {chat_title(t['peer_id'])}"]),
@@ -705,18 +750,22 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None) -> str:
         out += ["", "Ушли досрочно:", *early]
     notes = []
     if unmatched:
-        notes.append("⚠ — персонаж не найден на листе «Участники», CW ID не будет записан. "
+        notes.append(f"{mark} — персонаж не найден на листе «Участники», CW ID не будет записан. "
                      "Если имя написано с ошибкой, нажми на участника и исправь имя.")
     if trainer_warn[0]:
         notes.append("⚠ Тренер не найден на листе «Участники» по VK ID — CW ID тренера останется пустым.")
+    if fr and manual_nums:
+        used_groups.add("manual")
+    if fr and used_groups and not (confirmed_by or rejected_by):
+        notes.append("Пометки: " + "; ".join(FLAG_LEGEND[k] for k, *_ in FLAG_ORDER if k in used_groups))
     if notes:
         out += ["", *notes]
-    if not confirmed_by:
+    if not (confirmed_by or rejected_by):
         out += ["", REPORT_HELP]
     return "\n".join(out)
 
 
-REPORT_PAGE = 5  # записей на страницу (inline-клавиатура VK: ≤ 6 строк и ≤ 10 кнопок → по две кнопки в ряд)
+REPORT_PAGE = 4  # записей на страницу (inline-клавиатура VK: ≤ 6 строк и ≤ 10 кнопок: 4 + ◀/Добавить/▶ + время + 2 в последнем ряду)
 
 
 def _entry_label(prefix: str, num: int, name: str, j: int, l: int, warn: bool) -> str:
@@ -748,7 +797,7 @@ def report_entries(tid: int):
 
 
 def confirm_kb(tid: int, page: int = 0) -> str:
-    """Кнопки правок (по 5 записей на странице) + «Добавить участника» + «Подтвердить» (всегда последняя)."""
+    """Кнопки правок (по 4 записи на странице) + «Добавить участника» + «Подтвердить» / «Отклонить» (всегда последние)."""
     entries = report_entries(tid)
     pages = max(1, -(-len(entries) // REPORT_PAGE))
     page = max(0, min(page, pages - 1))
@@ -773,6 +822,21 @@ def confirm_kb(tid: int, page: int = 0) -> str:
     kb.add_callback_button(
         "Подтвердить", VkKeyboardColor.POSITIVE, payload={"cmd": "confirm", "tid": tid}
     )
+    kb.add_callback_button(
+        "Отклонить", VkKeyboardColor.NEGATIVE, payload={"cmd": "rp_rej", "tid": tid}
+    )
+    return kb.get_keyboard()
+
+
+REJECT_WARN = ("❗ Отклонить отчёт? В таблицу он записан не будет, кнопки пропадут у всех получателей. "
+               "Отменить это действие будет нельзя.")
+
+
+def reject_kb(tid: int) -> str:
+    """Повторное подтверждение отклонения."""
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("Да, отклонить", VkKeyboardColor.NEGATIVE, payload={"cmd": "rp_rej_yes", "tid": tid})
+    kb.add_callback_button("Отмена", VkKeyboardColor.SECONDARY, payload={"cmd": "rp_rej_no", "tid": tid})
     return kb.get_keyboard()
 
 
@@ -1933,7 +1997,7 @@ def handle_session_msg(uid: int, cmid, lines) -> bool:
     if sess["kind"] == "indiv":
         return handle_indiv_msg(uid, cmid, sess, lines)
     t = db.execute("SELECT * FROM trainings WHERE id=?", (sess["training_id"],)).fetchone()
-    if not t or t["status"] == "confirmed":
+    if not t or t["status"] in ("confirmed", "rejected"):
         clear_session(uid)
         return False
     if sess["kind"] == "time":
@@ -2031,7 +2095,7 @@ def find_report(uid: int, msg: dict):
             ).fetchone()
     return db.execute(
         "SELECT r.* FROM reports r JOIN trainings t ON t.id=r.training_id "
-        "WHERE r.user_id=? AND t.status!='confirmed' ORDER BY r.id DESC LIMIT 1",
+        "WHERE r.user_id=? AND t.status NOT IN ('confirmed','rejected') ORDER BY r.id DESC LIMIT 1",
         (uid,),
     ).fetchone()
 
@@ -2471,11 +2535,12 @@ def reply_to_report(uid: int, cmid, text: str):
         log.warning("Не удалось отправить сообщение %s: %s", uid, e)
 
 
-def strip_report_button(rep, confirmed_by: str) -> bool:
-    """Убирает кнопку «Подтвердить» и дописывает вверху, кто подтвердил. False — отредактировать нельзя."""
+def strip_report_button(rep, by: str, rejected: bool = False) -> bool:
+    """Убирает кнопки и дописывает вверху, кто подтвердил (или отклонил) отчёт. False — отредактировать нельзя."""
     if not rep["cmid"] or time.time() - rep["sent_ts"] >= EDIT_LIMIT_SEC:
         return False
-    text = render_report(rep["training_id"], note=rep["note"], confirmed_by=confirmed_by)
+    text = render_report(rep["training_id"], note=rep["note"],
+                         **({"rejected_by": by} if rejected else {"confirmed_by": by}))
     # сначала явно пустая inline-клавиатура, затем — правка без клавиатуры
     for kb in (json.dumps({"buttons": [], "inline": True}), None):
         args = dict(peer_id=rep["user_id"], conversation_message_id=rep["cmid"], message=text,
@@ -2506,8 +2571,38 @@ def handle_report_event(obj: dict):
         return answer_event(obj, "Править отчёт может только тот, кому он отправлен")
     if t["status"] == "confirmed":
         return answer_event(obj, "Уже подтверждено")
+    if t["status"] == "rejected":
+        return answer_event(obj, "Отчёт уже отклонён")
     try:
         k, n = p.get("k"), int(p.get("n") or 0)
+        if cmd in ("rp_rej", "rp_rej_no"):
+            rep_row = db.execute("SELECT * FROM reports WHERE training_id=? AND user_id=? AND cmid=?",
+                                 (tid, uid, cmid)).fetchone()
+            if cmd == "rp_rej":  # первый клик: просим подтвердить (прямо в этом же сообщении)
+                text = REJECT_WARN + "\n\n" + render_report(tid, note=rep_row["note"] if rep_row else None)
+                if not edit_msg(uid, cmid, text, reject_kb(tid)):  # сообщению больше суток — отдельное сообщение
+                    send_with_kb(uid, REJECT_WARN, reject_kb(tid))
+            elif rep_row:  # «Отмена»: возвращаем обычный вид отчёта
+                update_report(rep_row)
+            else:  # «Отмена» в отдельном сообщении подтверждения
+                delete_msg(uid, cmid)
+            return answer_event(obj)
+        if cmd == "rp_rej_yes":  # второй клик: отклоняем
+            db.execute("UPDATE trainings SET status='rejected' WHERE id=?", (tid,))
+            db.commit()
+            for ss in db.execute("SELECT * FROM edit_sessions WHERE training_id=?", (tid,)).fetchall():
+                delete_msg(ss["user_id"], ss["cmid"])
+            db.execute("DELETE FROM edit_sessions WHERE training_id=?", (tid,))
+            db.commit()
+            rejecter = user_link(uid)
+            reps = report_rows(tid)
+            if cmid not in {r["cmid"] for r in reps}:
+                delete_msg(uid, cmid)  # отдельное сообщение подтверждения больше не нужно
+            for rep in reps:  # кнопки убираются во ВСЕХ отправленных сообщениях с отчётом
+                if not strip_report_button(rep, rejecter, rejected=True):
+                    reply_to_report(rep["user_id"], rep["cmid"],
+                                    f"✖ Отчёт отклонил(а) {rejecter}, в таблицу он не записан")
+            return answer_event(obj, "Отчёт отклонён, в таблицу не записан")
         if cmd == "rp_page":
             rep_row = db.execute("SELECT * FROM reports WHERE training_id=? AND user_id=? AND cmid=?",
                                  (tid, uid, cmid)).fetchone()
@@ -2565,6 +2660,8 @@ def handle_event(obj: dict):
         return answer_event(obj, "Подтвердить может только тот, кому отправлен отчёт")
     if t["status"] == "confirmed":
         return answer_event(obj, "Уже подтверждено")
+    if t["status"] == "rejected":
+        return answer_event(obj, "Отчёт уже отклонён")
     if not write_to_google_sheet(tid):
         return answer_event(obj, "Не удалось записать в таблицу. Подробности в логе бота — попробуй ещё раз позже")
     db.execute("UPDATE trainings SET status='confirmed' WHERE id=?", (tid,))
