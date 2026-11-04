@@ -115,6 +115,16 @@ CREATE TABLE IF NOT EXISTS bot_settings(
     value TEXT NOT NULL
 );
 
+-- Свободный бег: о ком писал автор в последних отписях (для сообщений без имени и выбора между похожими именами)
+CREATE TABLE IF NOT EXISTS free_run_msgs(
+    peer_id INTEGER NOT NULL,
+    cmid    INTEGER NOT NULL,
+    from_id INTEGER,
+    ts      INTEGER NOT NULL,
+    names   TEXT NOT NULL,                     -- JSON: [{"name": "...", "vk_id": 123}]
+    PRIMARY KEY (peer_id, cmid)
+);
+
 -- Добавлено в более старые таблицы (бот делает это сам при запуске):
 --   ALTER TABLE chats   ADD COLUMN self_gov_days TEXT NOT NULL DEFAULT '';   -- дни самоуправления «0,2,5» (пн=0)
 --   ALTER TABLE reports ADD COLUMN note TEXT;                                -- пояснение вверху отчёта

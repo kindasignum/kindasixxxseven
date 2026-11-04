@@ -168,6 +168,10 @@ ensure_column("chats", "self_gov_days", "TEXT NOT NULL DEFAULT ''")
 ensure_column("reports", "note", "TEXT")
 ensure_column("reports", "page", "INTEGER NOT NULL DEFAULT 0")
 db.execute("CREATE TABLE IF NOT EXISTS bot_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+db.execute(
+    "CREATE TABLE IF NOT EXISTS free_run_msgs(peer_id INTEGER NOT NULL, cmid INTEGER NOT NULL, from_id INTEGER, "
+    "ts INTEGER NOT NULL, names TEXT NOT NULL, PRIMARY KEY(peer_id, cmid))"
+)
 ensure_column("participants", "deduct", "INTEGER NOT NULL DEFAULT 0")  # вычет минут по отписи (свободный бег)
 ensure_column("participants", "deduct_cmid", "INTEGER")
 ensure_column("participants", "flag", "TEXT")  # пометки для администратора
@@ -1382,8 +1386,26 @@ def apply_deduct_only(peer: int, cmid, seg: str, pr: dict, P: dict, flags, now: 
     return False
 
 
+def free_run_history(peer: int, uid: int, cmid, ts: int) -> dict:
+    """Недавние отписи с именами: у этого автора (для сообщений без имени) и в беседе (для выбора между похожими)."""
+    last, sender, chat = None, [], []
+    for r in db.execute("SELECT * FROM free_run_msgs WHERE peer_id=? AND ts>? AND ts<=? AND cmid<>? "
+                        "ORDER BY ts DESC, cmid DESC LIMIT 80", (peer, ts - 24 * 3600, ts + 60, cmid or 0)):
+        people = json.loads(r["names"])
+        for p in people:
+            if p["name"] not in chat:
+                chat.append(p["name"])
+        if r["from_id"] == uid:
+            if last is None and ts - r["ts"] <= 12 * 3600:
+                last = people
+            for p in people:
+                if p["name"] not in sender:
+                    sender.append(p["name"])
+    return {"last": last or [], "sender": sender, "chat": chat}
+
+
 def apply_free_run(peer: int, cmid, seg: str, pr: dict, ts: int, now: int) -> bool:
-    if not (pr["has_in"] or pr["has_out"] or pr["deduct"]):
+    if pr.get("invalid") or not (pr["has_in"] or pr["has_out"] or pr["deduct"]):
         return False
     people = pr["people"]
     if pr["all"]:  # «все ушли» — все, кто сейчас в забеге
@@ -1427,14 +1449,21 @@ def process_free_run(peer: int, chat, uid: int, cmid, text: str, ts: int, edited
     if edited and not FREE_RUN_SHADOW and not free_run_undo(peer, cmid):
         return True  # забег уже отправлен администраторам — правки только кнопками отчёта
     author = author_info(uid, members)
-    now, effect = int(time.time()), False
+    history = free_run_history(peer, uid, cmid, ts)
+    now, effect, named = int(time.time()), False, []
     for seg in segs:
-        pr = freerun.parse(seg, ts, members, author)
+        pr = freerun.parse(seg, ts, members, author, history)
+        if pr["explicit"] and not pr["invalid"]:
+            named += [{"name": p["name"], "vk_id": p.get("vk_id")} for p in pr["people"]]
         log.info("Свободный бег, беседа %s, сообщение %s: %r → люди=%s приход=%s уход=%s все=%s вычет=%s пометки=%s",
                  peer, cmid, seg[:80], [p["name"] for p in pr["people"]], pr["has_in"], pr["has_out"],
                  pr["all"], pr["deduct"], pr["flags"])
         if not FREE_RUN_SHADOW:
             effect = apply_free_run(peer, cmid, seg, pr, ts, now) or effect
+    if named and cmid:  # запоминаем, о ком писал автор: пригодится для сообщений без имени и похожих имён
+        db.execute("INSERT OR REPLACE INTO free_run_msgs(peer_id,cmid,from_id,ts,names) VALUES(?,?,?,?,?)",
+                   (peer, cmid, uid, ts, json.dumps(named, ensure_ascii=False)))
+        db.commit()
     if FREE_RUN_SHADOW:
         return True
     react(peer, cmid, "check" if effect else "question")
