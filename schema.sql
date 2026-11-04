@@ -109,6 +109,12 @@ CREATE TABLE IF NOT EXISTS menu_state(
     ts      INTEGER NOT NULL
 );
 
+-- Глобальные настройки бота (временно: free_run_delay — через сколько минут слать отчёт о свободном беге)
+CREATE TABLE IF NOT EXISTS bot_settings(
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 -- Добавлено в более старые таблицы (бот делает это сам при запуске):
 --   ALTER TABLE chats   ADD COLUMN self_gov_days TEXT NOT NULL DEFAULT '';   -- дни самоуправления «0,2,5» (пн=0)
 --   ALTER TABLE reports ADD COLUMN note TEXT;                                -- пояснение вверху отчёта

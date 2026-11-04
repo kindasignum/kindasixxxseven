@@ -167,6 +167,7 @@ def ensure_column(table: str, col: str, ddl: str):
 ensure_column("chats", "self_gov_days", "TEXT NOT NULL DEFAULT ''")
 ensure_column("reports", "note", "TEXT")
 ensure_column("reports", "page", "INTEGER NOT NULL DEFAULT 0")
+db.execute("CREATE TABLE IF NOT EXISTS bot_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
 ensure_column("participants", "deduct", "INTEGER NOT NULL DEFAULT 0")  # вычет минут по отписи (свободный бег)
 ensure_column("participants", "deduct_cmid", "INTEGER")
 ensure_column("participants", "flag", "TEXT")  # пометки для администратора
@@ -1456,7 +1457,7 @@ def finalize_free_run(t):
 
 
 def free_run_tick():
-    """Раз в минуту: закрывает «забытые» уходы (8 ч) и отправляет отчёт по забегам, где все ушли и тихо."""
+    """Раз в 15 секунд: закрывает «забытые» уходы (8 ч) и отправляет отчёт по забегам, где все ушли и тихо."""
     now = int(time.time())
     for t in db.execute("SELECT * FROM trainings WHERE kind='free_run' AND status='run'").fetchall():
         for p in db.execute("SELECT * FROM participants WHERE training_id=? AND leave_ts IS NULL AND join_ts<?",
@@ -1467,7 +1468,7 @@ def free_run_tick():
         db.commit()
         left = db.execute("SELECT COUNT(*) FROM participants WHERE training_id=? AND leave_ts IS NULL",
                           (t["id"],)).fetchone()[0]
-        if left == 0 and now - (t["touch_ts"] or now) >= FREE_RUN_GRACE_SEC:
+        if left == 0 and now - (t["touch_ts"] or now) >= get_free_run_delay() * 60:
             finalize_free_run(t)
 
 
@@ -2099,7 +2100,9 @@ def render_settings() -> str:
     if not chats:
         blocks.append("— пока нет бесед (бот увидит беседу после первого сообщения в ней)")
     # беседы разделены пустой строкой, параметры одной беседы — на соседних строках
-    return "Активные беседы:\n\n" + "\n\n".join(blocks) + "\n\n" + SETTINGS_HELP
+    return ("Активные беседы:\n\n" + "\n\n".join(blocks) + "\n\n" + SETTINGS_HELP
+            + f"\n\nОтчёт о свободном беге уходит администраторам: {fmt_delay(get_free_run_delay())} "
+              "после последней отписи (временная настройка).")
 
 
 def apply_settings(lines) -> bool:
@@ -2128,7 +2131,7 @@ def apply_settings(lines) -> bool:
     return True
 
 
-CHATS_PER_PAGE = 8  # inline-клавиатура VK: не больше 10 кнопок и 6 строк
+CHATS_PER_PAGE = 6  # inline-клавиатура VK: не больше 10 кнопок и 6 строк (ещё нужны стрелки и кнопка отчёта)
 SETTING_FLAGS = {"enabled", "free_run", "admins_only"}
 CLOSED_KB = json.dumps({"buttons": [], "inline": True})
 SEC, POS, NEG = VkKeyboardColor.SECONDARY, VkKeyboardColor.POSITIVE, VkKeyboardColor.NEGATIVE
@@ -2136,6 +2139,34 @@ SEC, POS, NEG = VkKeyboardColor.SECONDARY, VkKeyboardColor.POSITIVE, VkKeyboardC
 
 def _btn(kb, label: str, color, **payload):
     kb.add_callback_button(label[:40], color, payload=payload)
+
+
+DELAY_PRESETS = (0, 1, 2, 5, 10, 20, 30, 60)  # минуты
+
+
+def get_free_run_delay() -> int:
+    """Через сколько минут после последней отписи (все ушли) уходит отчёт о свободном беге. Временная настройка."""
+    r = db.execute("SELECT value FROM bot_settings WHERE key='free_run_delay'").fetchone()
+    return int(r["value"]) if r else FREE_RUN_GRACE_SEC // 60
+
+
+def fmt_delay(m: int) -> str:
+    return "сразу" if m == 0 else f"{m} мин"
+
+
+def delay_view(pg: int):
+    cur = get_free_run_delay()
+    text = ("Временная настройка для тестов.\nОтчёт о свободном беге уйдёт администраторам через выбранное время "
+            "после того, как все участники ушли и новых отписей нет (проверка раз в 15 секунд).\n"
+            f"Сейчас: {fmt_delay(cur)}")
+    kb = VkKeyboard(inline=True)
+    for i, m in enumerate(DELAY_PRESETS):
+        if i and i % 4 == 0:
+            kb.add_line()
+        _btn(kb, fmt_delay(m), POS if m == cur else SEC, cmd="cs_dset", v=m, pg=pg)
+    kb.add_line()
+    _btn(kb, "Вернуться", SEC, cmd="cs_dclose")
+    return text, kb.get_keyboard()
 
 
 def chat_num(c) -> int:
@@ -2146,9 +2177,7 @@ def main_settings_view(page: int = 0):
     """(текст, клавиатура) общего сообщения: список бесед и кнопки с их названиями."""
     text = render_settings()
     chats = db.execute("SELECT * FROM chats ORDER BY peer_id").fetchall()
-    if not chats:
-        return text, None
-    pages = (len(chats) + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE
+    pages = max(1, (len(chats) + CHATS_PER_PAGE - 1) // CHATS_PER_PAGE)
     page = max(0, min(page, pages - 1))
     kb = VkKeyboard(inline=True)
     for i, c in enumerate(chats[page * CHATS_PER_PAGE:(page + 1) * CHATS_PER_PAGE]):
@@ -2161,6 +2190,9 @@ def main_settings_view(page: int = 0):
             _btn(kb, "◀ Назад", SEC, cmd="cs_page", pg=page - 1)
         if page < pages - 1:
             _btn(kb, "Вперёд ▶", SEC, cmd="cs_page", pg=page + 1)
+    if chats:
+        kb.add_line()
+    _btn(kb, f"Отчёт о беге: {fmt_delay(get_free_run_delay())}", SEC, cmd="cs_delay", pg=page)  # временная настройка
     return text, kb.get_keyboard()
 
 
@@ -2281,6 +2313,18 @@ def handle_settings_event(obj: dict):
         if cmd == "cs_page":
             text, kb = main_settings_view(pg)
             edit_msg(uid, cmid, text, kb)
+            return answer_event(obj)
+        if cmd == "cs_delay":
+            send_with_kb(uid, *delay_view(pg))
+            return answer_event(obj)
+        if cmd == "cs_dset":
+            db.execute("INSERT OR REPLACE INTO bot_settings(key,value) VALUES('free_run_delay',?)", (str(int(p.get("v", 20))),))
+            db.commit()
+            edit_msg(uid, cmid, *delay_view(pg))
+            show_settings(uid, force_new=False, page=pg)
+            return answer_event(obj)
+        if cmd == "cs_dclose":
+            delete_msg(uid, cmid)
             return answer_event(obj)
         peer = int(p.get("peer", 0))
         c = get_chat(peer)
@@ -2596,7 +2640,7 @@ def main():
             while True:
                 for event in lp.check():
                     dispatch_event(event)
-                if time.time() - last_tick >= 60:
+                if time.time() - last_tick >= 15:
                     last_tick = time.time()
                     try:
                         free_run_tick()
