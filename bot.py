@@ -59,6 +59,8 @@ FREE_RUN_MAX_SEC = int(os.getenv("FREE_RUN_MAX_SEC", str(8 * 3600)))
 DEFAULT_CHAT_ENABLED = int(os.getenv("DEFAULT_CHAT_ENABLED", "1"))
 # запасной список админов сообщества (если VK не отдаёт список): VK ID через запятую
 ENV_ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("BOT_ADMIN_IDS", ""))}
+# запасной ID владельца сообщества для отладочных сообщений (если VK не отдаёт список руководителей)
+ENV_OWNER_IDS = {int(x) for x in re.findall(r"\d+", os.getenv("BOT_OWNER_IDS", ""))}
 
 
 def _rid(name):
@@ -486,6 +488,11 @@ def group_moderator_ids() -> set:
     return {u for u, r in group_roles().items() if r in MODER_ROLES} | ENV_ADMIN_IDS
 
 
+def group_owner_ids() -> set:
+    """Владелец (создатель) сообщества (+ запасной список BOT_OWNER_IDS)."""
+    return {u for u, r in group_roles().items() if r == "creator"} | ENV_OWNER_IDS
+
+
 def is_group_admin(uid: int) -> bool:
     return uid in group_admin_ids()
 
@@ -677,6 +684,15 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None, rejected
     fr = t["kind"] == "free_run"
     mark = "🚨" if fr else "⚠"
 
+    def spaced(items):
+        """Свободный бег: пустая строка перед каждым следующим участником (после пометок предыдущего)."""
+        res = []
+        for i, x in enumerate(items):
+            if i and fr:
+                res.append("")
+            res.append(x)
+        return res
+
     def line(p):
         m = minutes_of(p)
         warn = ""
@@ -744,7 +760,7 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None, rejected
         "",
         *([] if fr else [*trainer_lines, ""]),
         "Участники:",
-        *(stayed or ["—"]),
+        *(spaced(stayed) or ["—"]),
     ]
     if early:
         out += ["", "Ушли досрочно:", *early]
@@ -1504,6 +1520,101 @@ def free_run_undo(peer: int, cmid) -> bool:
     return True
 
 
+# ───────────── отладочные сообщения о непонятых отписях ─────────────
+DEBUG_MODES = ("owner", "admins", "off")  # кому слать: владельцу / всем администраторам сообщества / никому
+DEBUG_LABELS = {"owner": "владелец сообщества", "admins": "администраторы сообщества", "off": "выключены"}
+DEBUG_SHORT = {"owner": "владелец", "admins": "администраторы", "off": "выкл"}
+DEBUG_LIMIT, DEBUG_WINDOW = 20, 600  # не больше 20 отладочных сообщений за 10 минут (защита от спама в беседе)
+_debug_times, _debug_seen = [], set()
+
+
+def get_debug_mode() -> str:
+    r = db.execute("SELECT value FROM bot_settings WHERE key='debug_audience'").fetchone()
+    return r["value"] if r and r["value"] in DEBUG_MODES else "owner"
+
+
+def debug_recipients() -> set:
+    mode = get_debug_mode()
+    if mode == "off":
+        return set()
+    return group_owner_ids() if mode == "owner" else group_admin_ids()
+
+
+def send_debug(key, text: str):
+    """Отправляет отладочное сообщение получателям из настройки. Одно и то же — не дважды; не чаще лимита."""
+    uids = debug_recipients()
+    if not uids:
+        if get_debug_mode() != "off":
+            log.warning("Отладочное сообщение некому отправить: не определён владелец сообщества "
+                        "(задайте BOT_OWNER_IDS в .env или выдайте ключу доступ к списку руководителей)")
+        return
+    now = time.time()
+    if key in _debug_seen:
+        return
+    _debug_times[:] = [x for x in _debug_times if now - x < DEBUG_WINDOW]
+    if len(_debug_times) >= DEBUG_LIMIT:
+        log.warning("Лимит отладочных сообщений (%s за %s с) — это пропущено", DEBUG_LIMIT, DEBUG_WINDOW)
+        return
+    if len(_debug_seen) > 2000:
+        _debug_seen.clear()
+    _debug_seen.add(key)
+    _debug_times.append(now)
+    for u in sorted(uids):
+        send_dm(u, text[:3900])
+
+
+def free_run_fail_reason(pr: dict) -> str:
+    """Почему отпись не дала эффекта (для отладочного сообщения)."""
+    if pr.get("invalid"):
+        return "в тексте несуществующее время (часы больше 23 или минуты больше 59) — отпись отклонена целиком"
+    if not (pr["has_in"] or pr["has_out"] or pr["deduct"]):
+        why = ("не найдено ни действие (пришёл/ушёл и т. п.), ни время, которое можно связать с приходом "
+               "или уходом, ни вычет минут")
+        if pr["explicit"]:
+            why += "; имя распознано, а что человек сделал — нет"
+        return why
+    if pr["all"]:
+        return "«все ушли»: в открытом забеге нет ни одного участника без отметки ухода"
+    if pr["deduct"] and not (pr["has_in"] or pr["has_out"]):
+        names = ", ".join(p["name"] for p in pr["people"]) or "—"
+        return f"вычет {pr['deduct']} мин: не найдена запись свободного бега за последние 12 часов у: {names}"
+    return "действие распознано, но применить его не удалось (причина не определена — смотри лог бота)"
+
+
+def report_misunderstood(peer: int, uid: int, cmid, text: str, ts: int, edited: bool, failed):
+    """Дебаг-лог в ЛС: бот поставил ❓ на сообщение в беседе — что именно не получилось. Никогда не бросает исключений."""
+    try:
+        def act(has, t_):
+            return "нет" if not has else (f"{dt(t_):%d.%m %H:%M}" if t_ is not None else "по времени сообщения")
+
+        lines = [
+            "🐞 Бот не понял сообщение в беседе (поставил реакцию ❓)", "",
+            f"Беседа: {chat_title(peer)} (№{peer - 2_000_000_000})",
+            f"Автор: {user_link(uid)} (id{uid})",
+            f"Отправлено: {dt(ts):%d.%m.%Y %H:%M} МСК, сообщение №{cmid}" + (" — после правки" if edited else ""),
+            f"Текст: «{text[:600]}»", "", "Что пошло не так:",
+        ]
+        for i, (seg, pr) in enumerate(failed, 1):
+            people = ", ".join(p["name"] for p in pr["people"]) or "никого"
+            flags = list(dict.fromkeys(list(pr["flags"]) + [f for p in pr["people"] for f in p.get("flags", [])]))
+            lines += [
+                f"{i}. Отпись «{seg[:250]}»",
+                f"   Причина: {free_run_fail_reason(pr)}",
+                f"   Разобрано: люди — {people} ({'названы в тексте' if pr['explicit'] else 'в тексте не названы'}); "
+                f"приход — {act(pr['has_in'], pr['in_ts'])}; уход — {act(pr['has_out'], pr['out_ts'])}; "
+                f"«все» — {'да' if pr['all'] else 'нет'}; вычет — {pr['deduct']} мин",
+            ]
+            if flags:
+                lines.append("   Пометки разбора: " + "; ".join(flags))
+            if pr.get("unknown"):
+                lines.append("   Нераспознанные слова: " + ", ".join(pr["unknown"][:15]))
+            lines.append(f"   Текст в нормализованном виде: «{(pr.get('norm') or '')[:250]}»")
+        lines += ["", "Если автор поправит сообщение, бот перечитает его; иначе добавь участника вручную в отчёте."]
+        send_debug((peer, cmid, hash(text)), "\n".join(lines))
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось отправить отладочное сообщение")
+
+
 def process_free_run(peer: int, chat, uid: int, cmid, text: str, ts: int, edited: bool = False) -> bool:
     """#бег в беседе со свободным бегом. True — понято (или осознанно пропущено); False — не поняли (❓)."""
     segs = freerun.segments(text)
@@ -1514,7 +1625,7 @@ def process_free_run(peer: int, chat, uid: int, cmid, text: str, ts: int, edited
         return True  # забег уже отправлен администраторам — правки только кнопками отчёта
     author = author_info(uid, members)
     history = free_run_history(peer, uid, cmid, ts)
-    now, effect, named = int(time.time()), False, []
+    now, effect, named, failed = int(time.time()), False, [], []
     for seg in segs:
         pr = freerun.parse(seg, ts, members, author, history)
         if pr["explicit"] and not pr["invalid"]:
@@ -1523,7 +1634,10 @@ def process_free_run(peer: int, chat, uid: int, cmid, text: str, ts: int, edited
                  peer, cmid, seg[:80], [p["name"] for p in pr["people"]], pr["has_in"], pr["has_out"],
                  pr["all"], pr["deduct"], pr["flags"])
         if not FREE_RUN_SHADOW:
-            effect = apply_free_run(peer, cmid, seg, pr, ts, now) or effect
+            ok = apply_free_run(peer, cmid, seg, pr, ts, now)
+            effect = ok or effect
+            if not ok:
+                failed.append((seg, pr))
     if named and cmid:  # запоминаем, о ком писал автор: пригодится для сообщений без имени и похожих имён
         db.execute("INSERT OR REPLACE INTO free_run_msgs(peer_id,cmid,from_id,ts,names) VALUES(?,?,?,?,?)",
                    (peer, cmid, uid, ts, json.dumps(named, ensure_ascii=False)))
@@ -1531,6 +1645,8 @@ def process_free_run(peer: int, chat, uid: int, cmid, text: str, ts: int, edited
     if FREE_RUN_SHADOW:
         return True
     react(peer, cmid, "check" if effect else "question")
+    if not effect:
+        report_misunderstood(peer, uid, cmid, text, ts, edited, failed)
     return effect
 
 
@@ -2195,7 +2311,8 @@ def render_settings() -> str:
     # беседы разделены пустой строкой, параметры одной беседы — на соседних строках
     return ("Активные беседы:\n\n" + "\n\n".join(blocks) + "\n\n" + SETTINGS_HELP
             + f"\n\nОтчёт о свободном беге уходит администраторам: {fmt_delay(get_free_run_delay())} "
-              "после последней отписи (временная настройка).")
+              "после последней отписи (временная настройка)."
+            f"\n\nОтладочные сообщения о непонятых отписях (❓) получают: {DEBUG_LABELS[get_debug_mode()]}.")
 
 
 def apply_settings(lines) -> bool:
@@ -2286,6 +2403,9 @@ def main_settings_view(page: int = 0):
     if chats:
         kb.add_line()
     _btn(kb, f"Отчёт о беге: {fmt_delay(get_free_run_delay())}", SEC, cmd="cs_delay", pg=page)  # временная настройка
+    kb.add_line()
+    mode = get_debug_mode()
+    _btn(kb, f"Отладка: {DEBUG_SHORT[mode]}", NEG if mode == "off" else SEC, cmd="cs_dbg", pg=page)
     return text, kb.get_keyboard()
 
 
@@ -2419,6 +2539,12 @@ def handle_settings_event(obj: dict):
         if cmd == "cs_dclose":
             delete_msg(uid, cmid)
             return answer_event(obj)
+        if cmd == "cs_dbg":  # владелец → администраторы → выключено → владелец …
+            new = DEBUG_MODES[(DEBUG_MODES.index(get_debug_mode()) + 1) % len(DEBUG_MODES)]
+            db.execute("INSERT OR REPLACE INTO bot_settings(key,value) VALUES('debug_audience',?)", (new,))
+            db.commit()
+            show_settings(uid, force_new=False, page=pg)
+            return answer_event(obj, f"Отладочные сообщения: {DEBUG_LABELS[new]}")
         peer = int(p.get("peer", 0))
         c = get_chat(peer)
         if not c:

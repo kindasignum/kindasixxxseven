@@ -390,7 +390,8 @@ def parse(text: str, msg_ts: int, members, author: dict, history: dict = None):
         flags.append("отпись неточная («видимо», «+-» и т. п.)")
     if invalid:
         return {"people": [], "explicit": False, "all": False, "has_in": False, "has_out": False, "in_ts": None,
-                "out_ts": None, "deduct": 0, "flags": list(dict.fromkeys(flags)), "invalid": True}
+                "out_ts": None, "deduct": 0, "flags": list(dict.fromkeys(flags)), "invalid": True,
+                "norm": s, "unknown": []}
 
     # имена
     all_flag = any(t["k"] == "w" and t["v"] in ("все", "всех") for t in T) and (has_in or has_out)
@@ -446,6 +447,8 @@ def parse(text: str, msg_ts: int, members, author: dict, history: dict = None):
                            "flags": [f"имя не указано — записан автор сообщения{note}"]})
     if deduct:
         flags.append(f"вычет {deduct} мин по отписи участника")
+    # слова, которые бот не отнёс ни к имени, ни к действию, ни к «шумовым» (для отладки непонятых отписей)
+    unknown = [t["v"] for t in T if t["k"] == "w" and not t.get("used") and not t.get("intent") and t["v"] not in STOP]
     return {"people": people, "explicit": explicit, "all": all_flag, "has_in": has_in, "has_out": has_out,
             "in_ts": in_ts, "out_ts": out_ts, "deduct": deduct, "flags": list(dict.fromkeys(flags)),
-            "invalid": False}
+            "invalid": False, "norm": s, "unknown": unknown}
