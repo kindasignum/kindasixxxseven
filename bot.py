@@ -3229,7 +3229,7 @@ def pending_messages() -> list:
         elif t["status"] == "run":
             running.append("\n".join([
                 f"🏃 Свободный бег идёт — с {dt(t['start_ts']):%d.%m.%Y %H:%M}", f"   {peer_txt}",
-                f"   Участников: {total} (ещё бегут: {inside})",
+                f"   Участников: {total} (ещё бегают: {inside})",
                 f"   Отчёт уйдёт всем администраторам сообщества через {fmt_delay(get_free_run_delay())} "
                 "после ухода последнего участника"]))
         else:
