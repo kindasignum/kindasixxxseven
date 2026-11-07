@@ -10,14 +10,21 @@ VK-бот учёта тренировок.
 Запуск:            python bot.py
 Список реакций VK: python bot.py --assets
 """
+import atexit
+import base64
+import hashlib
 import json
 import logging
 import os
 import random
 import re
+import shutil
+import signal
 import sqlite3
 import sys
+import threading
 import time
+import zlib
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -39,9 +46,19 @@ TOKEN = os.getenv("VK_TOKEN", "")
 GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))
 # База хранится в DATA_DIR (на хостинге — постоянный диск, например /app/data) или в DB_PATH
 DATA_DIR = os.getenv("DATA_DIR", "").strip()
+if not DATA_DIR and not os.getenv("DB_PATH") and os.path.isdir("/app/data") and os.access("/app/data", os.W_OK):
+    DATA_DIR = "/app/data"  # постоянный диск хостинга найден сам, переменная DATA_DIR не обязательна
 DB_PATH = os.getenv("DB_PATH") or (os.path.join(DATA_DIR, "trainings.db") if DATA_DIR else "trainings.db")
 if DB_PATH != ":memory:" and os.path.dirname(DB_PATH):
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+_db_migrated = None
+if DB_PATH != ":memory:" and not os.path.exists(DB_PATH):
+    # база от старой версии лежала рядом с кодом — один раз переносим её на постоянный диск
+    for _cand in ("trainings.db", os.path.join(os.path.dirname(os.path.abspath(__file__)), "trainings.db")):
+        if os.path.exists(_cand) and os.path.abspath(_cand) != os.path.abspath(DB_PATH):
+            shutil.copy2(_cand, DB_PATH)
+            _db_migrated = os.path.abspath(_cand)
+            break
 MSK = ZoneInfo("Europe/Moscow")
 EDIT_LIMIT_SEC = 24 * 3600  # VK разрешает редактировать сообщения сутки
 JOIN_TOLERANCE_SEC = 6 * 3600  # насколько раньше старта допускается время прихода при правках
@@ -49,6 +66,12 @@ JOIN_TOLERANCE_SEC = 6 * 3600  # насколько раньше старта д
 EDIT_POLL_SEC = int(os.getenv("EDIT_POLL_SEC", "20"))
 # 1 — писать в лог тип каждого полученного события (для диагностики Long Poll)
 LOG_EVENTS = os.getenv("LOG_EVENTS", "0") == "1"
+# резервная копия базы в Google Таблице (лист «Резерв бота»): 1 — включена; не чаще раза в N секунд
+BACKUP_TO_SHEET = os.getenv("BACKUP_TO_SHEET", "1") == "1"
+BACKUP_INTERVAL_SEC = int(os.getenv("BACKUP_INTERVAL_SEC", "30"))
+# как часто (сек) проверять, не удалили ли сообщения с командами; 0 — отключить. И сколько часов следить за сообщением
+DELETE_POLL_SEC = int(os.getenv("DELETE_POLL_SEC", "60"))
+DELETE_WATCH_SEC = int(os.getenv("DELETE_WATCH_HOURS", "48")) * 3600
 # свободный бег: 1 — только разбирать отписи и писать в лог (ничего не считать и не отправлять)
 FREE_RUN_SHADOW = os.getenv("FREE_RUN_SHADOW", "0") == "1"
 # через сколько секунд после последней отписи (когда все ушли) забег закрывается и уходит отчёт админам
@@ -80,6 +103,8 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
 )
 log = logging.getLogger("trainbot")
+if _db_migrated:
+    log.info("Найдена база от прежней версии (%s) — скопирована в %s", _db_migrated, os.path.abspath(DB_PATH))
 
 vk_session = None
 vk = None
@@ -177,9 +202,14 @@ db.execute(
 ensure_column("participants", "deduct", "INTEGER NOT NULL DEFAULT 0")  # вычет минут по отписи (свободный бег)
 ensure_column("participants", "deduct_cmid", "INTEGER")
 ensure_column("participants", "flag", "TEXT")  # пометки для администратора
+ensure_column("participants", "verified", "INTEGER NOT NULL DEFAULT 0")  # админ подтвердил правки бота
 ensure_column("participants", "src", "TEXT")   # текст отписи, по которой записан участник
 ensure_column("trainings", "touch_ts", "INTEGER")  # свободный бег: когда была последняя отпись
 ensure_column("trainings", "kind", "TEXT NOT NULL DEFAULT 'group'")  # group | individual
+ensure_column("trainings", "stop_cmid", "INTEGER")  # сообщение «/стоп» (если его удалят — тренировка продолжается)
+ensure_column("msg_log", "checked_ts", "INTEGER NOT NULL DEFAULT 0")  # когда проверяли, не удалено ли сообщение
+ensure_column("msg_log", "miss", "INTEGER NOT NULL DEFAULT 0")        # сколько проверок подряд его не нашли
+ensure_column("msg_log", "gone", "INTEGER NOT NULL DEFAULT 0")        # 1 — удаление обработано
 db.execute(
     "CREATE TABLE IF NOT EXISTS menu_state("
     "user_id INTEGER PRIMARY KEY, role TEXT NOT NULL DEFAULT '', ts INTEGER NOT NULL)"
@@ -664,7 +694,8 @@ def render_flags(flag_text: str):
     return lines, "manual" in buckets, set(buckets)
 
 
-def render_report(tid: int, note: str = None, confirmed_by: str = None, rejected_by: str = None) -> str:
+def render_report(tid: int, note: str = None, confirmed_by: str = None, rejected_by: str = None,
+                  void_reason: str = None) -> str:
     """
     note — пояснение, почему отчёт пришёл именно этому получателю;
     confirmed_by — ссылка на того, кто подтвердил запись (дописывается вверху);
@@ -696,7 +727,7 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None, rejected
     def line(p):
         m = minutes_of(p)
         warn = ""
-        if members and not members.participant(p["name"], p["vk_id"]):
+        if members and not (fr and p["verified"]) and not members.participant(p["name"], p["vk_id"]):
             warn = f" {mark}"
             unmatched.append(p["num"])
             manual_nums.add(p["num"])
@@ -750,9 +781,11 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None, rejected
         out += [f"✔ Запись подтвердил(а): {confirmed_by}", ""]
     if rejected_by:
         out += [f"✖ Отчёт отклонил(а): {rejected_by} — в таблицу не записан", ""]
+    if void_reason:
+        out += [f"✖ Отчёт отменён: {void_reason}. В таблицу он не записан", ""]
     if note:
         out += [f"ℹ {note}", ""]
-    if fr and manual_nums and not (confirmed_by or rejected_by):
+    if fr and manual_nums and not (confirmed_by or rejected_by or void_reason):
         out += ["🚨 Требуют ручной проверки: " + ", ".join(f"№{n}" for n in sorted(manual_nums)), ""]
     out += [
         head,
@@ -772,11 +805,11 @@ def render_report(tid: int, note: str = None, confirmed_by: str = None, rejected
         notes.append("⚠ Тренер не найден на листе «Участники» по VK ID — CW ID тренера останется пустым.")
     if fr and manual_nums:
         used_groups.add("manual")
-    if fr and used_groups and not (confirmed_by or rejected_by):
+    if fr and used_groups and not (confirmed_by or rejected_by or void_reason):
         notes.append("Пометки: " + "; ".join(FLAG_LEGEND[k] for k, *_ in FLAG_ORDER if k in used_groups))
     if notes:
         out += ["", *notes]
-    if not (confirmed_by or rejected_by):
+    if not (confirmed_by or rejected_by or void_reason):
         out += ["", REPORT_HELP]
     return "\n".join(out)
 
@@ -785,7 +818,8 @@ REPORT_PAGE = 4  # записей на страницу (inline-клавиату
 
 
 def _entry_label(prefix: str, num: int, name: str, j: int, l: int, warn: bool) -> str:
-    head = ("⚠ " if warn else "") + f"{prefix}{num}. "
+    mark = warn if isinstance(warn, str) else ("⚠" if warn else "")
+    head = (mark + " " if mark else "") + f"{prefix}{num}. "
     tail = f" {dt(j):%H:%M}-{dt(l):%H:%M}"
     room = 40 - len(head) - len(tail)  # у кнопки VK не больше 40 символов
     if len(name) > room:
@@ -806,7 +840,10 @@ def report_entries(tid: int):
             out.append({"k": "t", "n": r["num"], "label": _entry_label(
                 "Тр. ", r["num"], name, r["join_ts"], r["leave_ts"] or t["end_ts"], bool(members) and not found)})
     for p in db.execute("SELECT * FROM participants WHERE training_id=? ORDER BY num", (tid,)):
-        warn = bool(members) and not members.participant(p["name"], p["vk_id"])
+        if t["kind"] == "free_run":  # 🚨 — нужна ручная правка, ℹ️ — только автоправки бота
+            warn = entry_mark(t, p, members)
+        else:
+            warn = bool(members) and not members.participant(p["name"], p["vk_id"])
         out.append({"k": "p", "n": p["num"], "label": _entry_label(
             "", p["num"], p["name"], p["join_ts"], p["leave_ts"] or t["end_ts"], warn)})
     return out
@@ -1176,8 +1213,8 @@ def stop_training(peer: int, chat, tr, uid: int, cmid, text: str, ts: int):
     )
     db.execute("UPDATE trainers SET leave_ts=? WHERE training_id=? AND leave_ts IS NULL", (end, tr["id"]))
     db.execute(
-        "UPDATE trainings SET status='finished', end_ts=?, stopper_id=? WHERE id=?",
-        (end, uid, tr["id"]),
+        "UPDATE trainings SET status='finished', end_ts=?, stopper_id=?, stop_cmid=? WHERE id=?",
+        (end, uid, cmid, tr["id"]),
     )
     db.commit()
     chat_title(peer, refresh=True)  # актуальное название на момент отчёта
@@ -1190,7 +1227,7 @@ def replay_log(peer: int, chat, tr):
     Тренировка начата «задним числом» (исправленным /старт): применяем #лапа, #уход и «+ тренер»,
     написанные после этого сообщения, со временем их отправки.
     """
-    rows = db.execute("SELECT * FROM msg_log WHERE peer_id=? AND cmid>? ORDER BY cmid",
+    rows = db.execute("SELECT * FROM msg_log WHERE peer_id=? AND cmid>? AND gone=0 ORDER BY cmid",
                       (peer, tr["start_cmid"] or 0)).fetchall()
     for r in rows:
         text = MENTION_RE.sub("", r["text"] or "").strip()
@@ -1224,7 +1261,7 @@ def process_chat_command(peer: int, chat, uid: int, cmid, text: str, ts: int, ed
             return True  # в беседе тренировки ведут только администраторы
         if edited:
             # исправили сообщение: стартуем задним числом, только если в ближайшие 2 часа нет «/стоп»
-            for r in db.execute("SELECT text FROM msg_log WHERE peer_id=? AND cmid>? AND date>=? AND date<=?",
+            for r in db.execute("SELECT text FROM msg_log WHERE peer_id=? AND cmid>? AND date>=? AND date<=? AND gone=0",
                                 (peer, cmid or 0, ts, ts + RETRO_STOP_WINDOW_SEC)):
                 if RE_STOP.search(MENTION_RE.sub("", r["text"] or "").strip()):
                     log.info("Правка /старт (беседа %s, сообщение %s): в ближайшие 2 часа есть /стоп — "
@@ -1499,23 +1536,36 @@ def apply_free_run(peer: int, cmid, seg: str, pr: dict, ts: int, now: int) -> bo
     return effect
 
 
-def free_run_undo(peer: int, cmid) -> bool:
-    """Исправили сообщение: снимаем его прежние действия в ещё не закрытом забеге. False — забег уже отправлен."""
+def free_run_undo(peer: int, cmid, allow_sent: bool = False, touched: list = None) -> bool:
+    """
+    Снимает действия сообщения cmid. По умолчанию — только в ещё не закрытом забеге (False — забег уже отправлен).
+    allow_sent=True (сообщение удалено) — и в забеге, отчёт по которому отправлен, но ещё не подтверждён;
+    touched — туда попадают id таких забегов, чтобы обновить их отчёты.
+    """
     rows = db.execute(
         "SELECT p.*, t.status AS tstatus FROM participants p JOIN trainings t ON t.id=p.training_id "
         "WHERE t.peer_id=? AND t.kind='free_run' AND (p.join_cmid=? OR p.leave_cmid=? OR p.deduct_cmid=?)",
         (peer, cmid, cmid, cmid)).fetchall()
-    if any(r["tstatus"] != "run" for r in rows):
+    ok = ("run", "finished") if allow_sent else ("run",)
+    if any(r["tstatus"] not in ok for r in rows):
         return False
     for r in rows:
+        sent = r["tstatus"] != "run"
+        if sent and touched is not None:
+            touched.append(r["training_id"])
         if r["join_cmid"] == cmid:
             db.execute("DELETE FROM participants WHERE id=?", (r["id"],))
             continue
+        db.execute("UPDATE participants SET flag=NULL, src=NULL WHERE id=?", (r["id"],))
         if r["leave_cmid"] == cmid:
-            db.execute("UPDATE participants SET leave_ts=NULL, leave_cmid=NULL WHERE id=?", (r["id"],))
+            if sent:  # забег уже закрыт: без сообщения об уходе участник остаётся «без ухода»
+                db.execute("UPDATE participants SET leave_ts=join_ts, leave_cmid=NULL, auto_leave=1 WHERE id=?",
+                           (r["id"],))
+                add_flags(r["id"], ["нет ухода: сообщение с уходом удалено — укажите время ухода"])
+            else:
+                db.execute("UPDATE participants SET leave_ts=NULL, leave_cmid=NULL WHERE id=?", (r["id"],))
         if r["deduct_cmid"] == cmid:
             db.execute("UPDATE participants SET deduct=0, deduct_cmid=NULL WHERE id=?", (r["id"],))
-        db.execute("UPDATE participants SET flag=NULL, src=NULL WHERE id=?", (r["id"],))
     db.commit()
     return True
 
@@ -1871,6 +1921,19 @@ def clear_session(uid: int, cmid=None):
     db.commit()
 
 
+def entry_mark(t, p, members) -> str:
+    """
+    Свободный бег: непроверенные пометки бота у участника. «🚨» — нужна ручная правка (или персонаж не найден
+    на листе «Участники»), «ℹ️» — только автоматические правки, «» — всё чисто / участник подтверждён.
+    """
+    if t["kind"] != "free_run":
+        return ""
+    unmatched = bool(members) and not p["verified"] and not members.participant(p["name"], p["vk_id"])
+    if unmatched or (p["flag"] and render_flags(p["flag"])[1]):
+        return "🚨"
+    return "ℹ️" if p["flag"] else ""
+
+
 def get_entry(tid: int, k: str, n: int):
     tbl = "trainers" if k == "t" else "participants"
     return db.execute(f"SELECT * FROM {tbl} WHERE training_id=? AND num=?", (tid, n)).fetchone()
@@ -1886,8 +1949,17 @@ def entry_text(tid: int, k: str, n: int):
         leave = row["leave_ts"] or t["end_ts"]
     else:
         name, leave = row["name"], row["leave_ts"] or t["end_ts"]
+    marks = ""
+    if k == "p" and t["kind"] == "free_run":
+        members = get_members()
+        lines = render_flags(row["flag"])[0] if row["flag"] else []
+        if members and not row["verified"] and not members.participant(row["name"], row["vk_id"]):
+            lines.append("🚨 Персонаж не найден на листе «Участники» — CW ID не будет записан")
+        if lines:
+            marks = ("\n\nПометки бота:\n" + "\n".join(lines) +
+                     "\n«Подтвердить правки» снимает пометки: участник считается проверенным.")
     return (f"Выбран {'тренер' if k == 't' else 'участник'}: {n}. {name}, "
-            f"{fmt_t(row['join_ts'], t['start_ts'])} - {fmt_t(leave, t['start_ts'])}\n\n"
+            f"{fmt_t(row['join_ts'], t['start_ts'])} - {fmt_t(leave, t['start_ts'])}{marks}\n\n"
             "Отправь ответным сообщением:\n"
             "имя Новое Имя — сменить имя\n"
             "время 15:00-16:30 — изменить время участия\n\n"
@@ -1896,6 +1968,13 @@ def entry_text(tid: int, k: str, n: int):
 
 def entry_kb(tid: int, k: str, n: int) -> str:
     kb = VkKeyboard(inline=True)
+    row = get_entry(tid, k, n) if k == "p" else None
+    if row is not None:
+        t = db.execute("SELECT * FROM trainings WHERE id=?", (tid,)).fetchone()
+        if entry_mark(t, row, get_members()):  # есть непроверенные пометки бота
+            kb.add_callback_button("Подтвердить правки", VkKeyboardColor.POSITIVE,
+                                   payload={"cmd": "rp_ok", "tid": tid, "k": k, "n": n})
+            kb.add_line()
     kb.add_callback_button("Удалить", VkKeyboardColor.NEGATIVE, payload={"cmd": "rp_del", "tid": tid, "k": k, "n": n})
     kb.add_callback_button("Вернуться", VkKeyboardColor.SECONDARY, payload={"cmd": "rp_back"})
     return kb.get_keyboard()
@@ -2139,6 +2218,8 @@ def handle_session_msg(uid: int, cmid, lines) -> bool:
 
 # ───────────────────────── меню (постоянные кнопки над полем ввода) ─────────────────────────
 MENU_SETTINGS, MENU_INDIV = "Настройка", "Индивидуальная тренировка"
+MENU_PENDING = "Отчёты в обработке"
+MENU_VERSION = 2  # при смене кнопок администраторам один раз показывается обновлённое меню
 
 
 def menu_role(uid: int) -> str:
@@ -2149,6 +2230,7 @@ def menu_kb(role: str) -> str:
     kb = VkKeyboard(one_time=False)
     if role == "admin":
         kb.add_button(MENU_SETTINGS, VkKeyboardColor.SECONDARY)
+        kb.add_button(MENU_PENDING, VkKeyboardColor.SECONDARY)
         kb.add_line()
     kb.add_button(MENU_INDIV, VkKeyboardColor.SECONDARY)
     return kb.get_keyboard()
@@ -2160,12 +2242,14 @@ def ensure_menu(uid: int, force: bool = False):
         return
     try:
         role = menu_role(uid)
+        key = f"admin:{MENU_VERSION}" if role == "admin" else role
         row = db.execute("SELECT role FROM menu_state WHERE user_id=?", (uid,)).fetchone()
         old = row["role"] if row else ""
-        if role == old and not (force and role):
+        if key == old and not (force and role):
             return
         if role:
-            names = f"«{MENU_SETTINGS}» и «{MENU_INDIV}»" if role == "admin" else f"«{MENU_INDIV}»"
+            names = (f"«{MENU_SETTINGS}», «{MENU_PENDING}» и «{MENU_INDIV}»" if role == "admin"
+                     else f"«{MENU_INDIV}»")
             text, kb = f"Меню включено: {names} всегда под рукой над полем ввода.", menu_kb(role)
         else:
             text, kb = "Меню скрыто: у тебя больше нет доступа к его функциям.", json.dumps(
@@ -2173,7 +2257,7 @@ def ensure_menu(uid: int, force: bool = False):
         vk.messages.send(peer_id=uid, random_id=random.getrandbits(31), message=text,
                          keyboard=kb, disable_mentions=1)
         db.execute("INSERT OR REPLACE INTO menu_state(user_id,role,ts) VALUES(?,?,?)",
-                   (uid, role, int(time.time())))
+                   (uid, key, int(time.time())))
         db.commit()
     except Exception as e:  # noqa: BLE001
         log.warning("Не удалось показать меню %s: %s", uid, e)
@@ -2190,6 +2274,10 @@ def handle_menu(msg: dict) -> bool:
     elif text == MENU_SETTINGS.casefold():
         if is_group_admin(uid):
             show_settings(uid, force_new=True)
+            return True
+    elif text == MENU_PENDING.casefold():
+        if is_group_admin(uid):
+            show_pending(uid)
             return True
     elif text == MENU_INDIV.casefold():
         if is_group_moderator(uid):
@@ -2661,12 +2749,13 @@ def reply_to_report(uid: int, cmid, text: str):
         log.warning("Не удалось отправить сообщение %s: %s", uid, e)
 
 
-def strip_report_button(rep, by: str, rejected: bool = False) -> bool:
+def strip_report_button(rep, by: str = None, rejected: bool = False, reason: str = None) -> bool:
     """Убирает кнопки и дописывает вверху, кто подтвердил (или отклонил) отчёт. False — отредактировать нельзя."""
     if not rep["cmid"] or time.time() - rep["sent_ts"] >= EDIT_LIMIT_SEC:
         return False
-    text = render_report(rep["training_id"], note=rep["note"],
-                         **({"rejected_by": by} if rejected else {"confirmed_by": by}))
+    kw = ({"void_reason": reason} if reason
+          else {"rejected_by": by} if rejected else {"confirmed_by": by})
+    text = render_report(rep["training_id"], note=rep["note"], **kw)
     # сначала явно пустая inline-клавиатура, затем — правка без клавиатуры
     for kb in (json.dumps({"buttons": [], "inline": True}), None):
         args = dict(peer_id=rep["user_id"], conversation_message_id=rep["cmid"], message=text,
@@ -2701,6 +2790,15 @@ def handle_report_event(obj: dict):
         return answer_event(obj, "Отчёт уже отклонён")
     try:
         k, n = p.get("k"), int(p.get("n") or 0)
+        if cmd == "rp_ok":  # «Подтвердить правки»: пометки бота снимаются, участник считается проверенным
+            row = get_entry(tid, "p", n) if k == "p" and t["kind"] == "free_run" else None
+            if not row:
+                return answer_event(obj, "Не найден (возможно, уже удалён)")
+            db.execute("UPDATE participants SET flag=NULL, src=NULL, verified=1 WHERE id=?", (row["id"],))
+            db.commit()
+            update_all_reports(tid)  # отчёт у всех получателей без пометок
+            edit_msg(uid, cmid, entry_text(tid, "p", n), entry_kb(tid, "p", n))  # кнопка исчезает
+            return answer_event(obj, "Правки подтверждены, пометки сняты")
         if cmd in ("rp_rej", "rp_rej_no"):
             rep_row = db.execute("SELECT * FROM reports WHERE training_id=? AND user_id=? AND cmid=?",
                                  (tid, uid, cmid)).fetchone()
@@ -2815,6 +2913,355 @@ def handle_event(obj: dict):
             reply_to_report(rep["user_id"], rep["cmid"], f"✔ Запись по этому отчёту подтвердил(а) {confirmer}")
 
 
+# ───────────────────────── удалённые сообщения ─────────────────────────
+def void_training(tid: int, reason: str):
+    """Тренировка/забег не засчитывается: статус «отклонена», кнопки отчётов убираются, причина пишется вверху."""
+    db.execute("UPDATE trainings SET status='rejected' WHERE id=?", (tid,))
+    for ss in db.execute("SELECT * FROM edit_sessions WHERE training_id=?", (tid,)).fetchall():
+        delete_msg(ss["user_id"], ss["cmid"])
+    db.execute("DELETE FROM edit_sessions WHERE training_id=?", (tid,))
+    db.commit()
+    for rep in report_rows(tid):
+        if not strip_report_button(rep, reason=reason):
+            reply_to_report(rep["user_id"], rep["cmid"], f"✖ Отчёт отменён: {reason}. В таблицу он не записан")
+
+
+def revert_stop(t) -> bool:
+    """Сообщение «/стоп» удалили: тренировка снова идёт, отправленные отчёты отзываются. False — вернуть нельзя."""
+    cur = active_training(t["peer_id"])
+    if cur and cur["id"] != t["id"]:
+        log.warning("Удалён /стоп тренировки %s, но в беседе уже идёт другая — тренировку не возвращаю", t["id"])
+        return False
+    tid = t["id"]
+    for ss in db.execute("SELECT * FROM edit_sessions WHERE training_id=?", (tid,)).fetchall():
+        delete_msg(ss["user_id"], ss["cmid"])
+    db.execute("DELETE FROM edit_sessions WHERE training_id=?", (tid,))
+    for rep in report_rows(tid):
+        if not strip_report_button(rep, reason="удалено сообщение с /стоп, тренировка продолжается"):
+            reply_to_report(rep["user_id"], rep["cmid"], "✖ Отчёт отменён: удалено сообщение с /стоп")
+    db.execute("DELETE FROM reports WHERE training_id=?", (tid,))
+    db.execute("UPDATE participants SET leave_ts=NULL, auto_leave=0 WHERE training_id=? AND auto_leave=1", (tid,))
+    db.execute("UPDATE trainers SET leave_ts=NULL WHERE training_id=? AND leave_cmid IS NULL AND leave_ts=?",
+               (tid, t["end_ts"]))
+    db.execute("UPDATE trainings SET status='active', end_ts=NULL, stopper_id=NULL, stop_cmid=NULL WHERE id=?", (tid,))
+    db.commit()
+    return True
+
+
+def command_deleted(peer: int, cmid):
+    """
+    Сообщение с командой удалили: его действие снимается, пока отчёт не подтверждён. То, что уже записано в
+    таблицу, не трогаем — о таком только сообщаем владельцу (поправить вручную).
+    """
+    log.info("Удалено сообщение с командой (беседа %s, сообщение %s) — снимаю его действие", peer, cmid)
+    db.execute("DELETE FROM free_run_msgs WHERE peer_id=? AND cmid=?", (peer, cmid))
+    db.commit()
+    recorded, refresh = [], set()
+
+    # свободный бег
+    if db.execute(
+            "SELECT 1 FROM participants p JOIN trainings t ON t.id=p.training_id WHERE t.peer_id=? "
+            "AND t.kind='free_run' AND t.status='confirmed' AND (p.join_cmid=? OR p.leave_cmid=? OR p.deduct_cmid=?)",
+            (peer, cmid, cmid, cmid)).fetchone():
+        recorded.append("забег свободного бега")
+    touched = []
+    free_run_undo(peer, cmid, allow_sent=True, touched=touched)
+    for tid in dict.fromkeys(touched):
+        if db.execute("SELECT COUNT(*) FROM participants WHERE training_id=?", (tid,)).fetchone()[0] == 0:
+            void_training(tid, "все записи забега удалены вместе с сообщениями")
+        else:
+            refresh.add(tid)
+
+    # /старт и /стоп групповой тренировки
+    for t in db.execute("SELECT * FROM trainings WHERE peer_id=? AND kind='group' AND (start_cmid=? OR stop_cmid=?)",
+                        (peer, cmid, cmid)).fetchall():
+        if t["status"] == "confirmed":
+            recorded.append("тренировка " + " ".join(training_label(t)))
+        elif t["start_cmid"] == cmid and t["status"] in ("active", "finished"):
+            void_training(t["id"], "удалено сообщение с /старт")
+        elif t["stop_cmid"] == cmid and t["status"] == "finished":
+            revert_stop(t)
+
+    # #лапа / #уход участников и «+ тренер» / #уход тренеров
+    for p in db.execute(
+            "SELECT p.*, t.status AS tstatus, t.end_ts AS tend FROM participants p JOIN trainings t "
+            "ON t.id=p.training_id WHERE t.peer_id=? AND t.kind='group' AND (p.join_cmid=? OR p.leave_cmid=?)",
+            (peer, cmid, cmid)).fetchall():
+        if p["tstatus"] == "confirmed":
+            recorded.append(f"участник {p['name']}")
+            continue
+        if p["tstatus"] not in ("active", "finished"):
+            continue
+        if p["join_cmid"] == cmid:
+            db.execute("DELETE FROM participants WHERE id=?", (p["id"],))
+        else:
+            if p["tstatus"] == "active":
+                db.execute("UPDATE participants SET leave_ts=NULL, leave_cmid=NULL WHERE id=?", (p["id"],))
+            else:  # тренировка закрыта: без #уход участник уходит в момент окончания
+                db.execute("UPDATE participants SET leave_ts=?, leave_cmid=NULL, auto_leave=1 WHERE id=?",
+                           (p["tend"], p["id"]))
+            react(peer, p["join_cmid"], "eye")
+        if p["tstatus"] == "finished":
+            refresh.add(p["training_id"])
+    for r in db.execute(
+            "SELECT r.*, t.status AS tstatus, t.end_ts AS tend, t.start_cmid AS tstart FROM trainers r "
+            "JOIN trainings t ON t.id=r.training_id WHERE t.peer_id=? AND t.kind='group' "
+            "AND (r.join_cmid=? OR r.leave_cmid=?)", (peer, cmid, cmid)).fetchall():
+        if r["tstatus"] == "confirmed":
+            recorded.append("тренер тренировки")
+            continue
+        if r["tstatus"] not in ("active", "finished"):
+            continue
+        if r["join_cmid"] == cmid:
+            if cmid == r["tstart"]:
+                continue  # это /старт — тренировка уже отменена выше
+            db.execute("DELETE FROM trainers WHERE id=?", (r["id"],))
+        elif r["tstatus"] == "active":
+            db.execute("UPDATE trainers SET leave_ts=NULL, leave_cmid=NULL WHERE id=?", (r["id"],))
+        else:
+            db.execute("UPDATE trainers SET leave_ts=?, leave_cmid=NULL WHERE id=?", (r["tend"], r["id"]))
+        if r["tstatus"] == "finished":
+            refresh.add(r["training_id"])
+    db.commit()
+
+    for tid in refresh:
+        t = db.execute("SELECT status FROM trainings WHERE id=?", (tid,)).fetchone()
+        if t and t["status"] == "finished":
+            update_all_reports(tid)
+    if recorded:
+        send_debug(("del", peer, cmid),
+                   f"🗑 Удалено сообщение с командой, но оно уже учтено в записанном отчёте "
+                   f"({', '.join(dict.fromkeys(recorded))}).\nБеседа: {chat_title(peer)} (№{peer - 2_000_000_000}), "
+                   f"сообщение №{cmid}. Таблицу бот не меняет — поправьте запись вручную.")
+
+
+def poll_deleted_messages():
+    """
+    VK не присылает боту событие об удалении сообщения, поэтому раз в DELETE_POLL_SEC секунд проверяем недавние
+    сообщения с командами: свежие — каждый раз, старые — раз в 10 минут. Пропавшее сообщение считается удалённым
+    после двух проверок подряд (защита от случайного сбоя VK).
+    """
+    now = int(time.time())
+    rows = db.execute(
+        "SELECT * FROM msg_log WHERE gone=0 AND added_ts>? AND ((added_ts>? AND checked_ts<?) OR checked_ts<?) "
+        "ORDER BY peer_id, cmid", (now - DELETE_WATCH_SEC, now - 7200, now - DELETE_POLL_SEC + 5, now - 600)).fetchall()
+    by_peer = {}
+    for r in rows:
+        by_peer.setdefault(r["peer_id"], []).append(r)
+    for peer, items_ in by_peer.items():
+        for i in range(0, len(items_), 100):
+            chunk = items_[i:i + 100]
+            try:
+                resp = vk.messages.getByConversationMessageId(
+                    peer_id=peer, conversation_message_ids=",".join(str(w["cmid"]) for w in chunk))
+            except ApiError as e:
+                log.warning("Проверка удалений: не удалось прочитать сообщения беседы %s: %s", peer, e)
+                break
+            found = {it.get("conversation_message_id") for it in resp.get("items", [])}
+            need = 3 if not found and len(chunk) >= 3 else 2  # «пропало всё сразу» — скорее сбой, ждём дольше
+            for w in chunk:
+                if w["cmid"] in found:
+                    db.execute("UPDATE msg_log SET miss=0, checked_ts=? WHERE peer_id=? AND cmid=?",
+                               (now, peer, w["cmid"]))
+                    continue
+                miss = w["miss"] + 1
+                gone = 1 if miss >= need else 0
+                db.execute("UPDATE msg_log SET miss=?, checked_ts=?, gone=? WHERE peer_id=? AND cmid=?",
+                           (miss, now, gone, peer, w["cmid"]))
+                db.commit()
+                if gone:
+                    try:
+                        command_deleted(peer, w["cmid"])
+                    except Exception:  # noqa: BLE001
+                        log.exception("Ошибка обработки удалённого сообщения %s/%s", peer, w["cmid"])
+            db.commit()
+
+
+# ───────────────────────── резервная копия базы ─────────────────────────
+# Основная база лежит на постоянном диске (DATA_DIR, см. выше). Параллельно её содержимое раз в BACKUP_INTERVAL_SEC
+# секунд (если что-то изменилось) сохраняется в Google Таблицу — лист «Резерв бота». Если хостинг стёр диск
+# (обновление, пересоздание контейнера) и база при запуске пустая, бот восстанавливает данные из этого листа.
+BACKUP_TABLES = ("chats", "bot_settings", "trainings", "participants", "trainers", "reports",
+                 "settings_msgs", "free_run_msgs", "menu_state", "edit_sessions")
+_backup = {"enabled": False, "hash": None, "changes": -1, "ts": 0.0, "thread": None, "retry_ts": 0.0}
+
+
+def build_snapshot():
+    """(строка base64 со сжатым JSON всех таблиц, число значимых записей: беседы + тренировки + настройки)."""
+    data, meaningful = {"v": 1, "tables": {}}, 0
+    for tbl in BACKUP_TABLES:
+        cur = db.execute(f"SELECT * FROM {tbl} ORDER BY rowid")
+        rows = [list(r) for r in cur.fetchall()]
+        data["tables"][tbl] = {"cols": [d[0] for d in cur.description], "rows": rows}
+        if tbl in ("chats", "bot_settings", "trainings"):
+            meaningful += len(rows)
+    raw = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.b64encode(zlib.compress(raw, 9)).decode("ascii"), meaningful
+
+
+def restore_snapshot(blob: str) -> int:
+    """Загружает копию в базу (INSERT OR REPLACE по ключам; незнакомые столбцы пропускаются). Возвращает число строк."""
+    data = json.loads(zlib.decompress(base64.b64decode(blob)).decode("utf-8"))
+    total = 0
+    with db:
+        for tbl in BACKUP_TABLES:
+            d = data.get("tables", {}).get(tbl)
+            if not d:
+                continue
+            have = {r["name"] for r in db.execute(f"PRAGMA table_info({tbl})")}
+            cols = [c for c in d["cols"] if c in have]
+            idx = [d["cols"].index(c) for c in cols]
+            sql = f"INSERT OR REPLACE INTO {tbl}({','.join(cols)}) VALUES({','.join('?' * len(cols))})"
+            for row in d["rows"]:
+                db.execute(sql, [row[i] for i in idx])
+                total += 1
+    return total
+
+
+def db_is_fresh() -> bool:
+    return build_snapshot()[1] == 0
+
+
+def startup_restore():
+    """При запуске: если база пуста, а в таблице есть резервная копия — восстанавливаем. Включает резервирование."""
+    _backup["retry_ts"] = time.time()
+    fresh = db_is_fresh()
+    if not BACKUP_TO_SHEET:
+        return
+    try:
+        import sheets
+        got = sheets.read_backup()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не удалось прочитать резервную копию из таблицы: %s", e)
+        if not fresh:
+            _backup["enabled"] = True  # база не пуста — копировать можно, затирать резерв пустотой нельзя
+        return
+    if fresh and got:
+        n = restore_snapshot(got[0])
+        _names.clear()
+        log.warning("База была пуста — ДАННЫЕ ВОССТАНОВЛЕНЫ из резервной копии в таблице (%s записей, копия от %s)",
+                    n, got[1].get("saved_at", "?"))
+    elif fresh:
+        log.info("База пуста, резервной копии в таблице нет — начинаем с чистого листа")
+    else:
+        log.info("База данных не пуста — восстановление не требуется")
+    _backup["enabled"] = True
+
+
+def backup_tick(force: bool = False):
+    """Раз в BACKUP_INTERVAL_SEC секунд (если база менялась) отправляет копию в таблицу (в фоне, не тормозит бота)."""
+    if not BACKUP_TO_SHEET:
+        return
+    now = time.time()
+    if not _backup["enabled"]:
+        if force or now - _backup["retry_ts"] < 300:
+            return
+        startup_restore()
+        if not _backup["enabled"]:
+            return
+    if not force and (now - _backup["ts"] < BACKUP_INTERVAL_SEC or db.total_changes == _backup["changes"]):
+        return
+    th = _backup["thread"]
+    if th is not None and th.is_alive():
+        if not force:
+            return
+        th.join(30)
+    blob, meaningful = build_snapshot()
+    _backup["ts"], _backup["changes"] = now, db.total_changes
+    if meaningful == 0:
+        return  # пустую базу в резерв не пишем
+    h = hashlib.sha256(blob.encode("ascii")).hexdigest()
+    if h == _backup["hash"]:
+        return
+
+    def work():
+        try:
+            import sheets
+            sheets.write_backup(blob, {"saved_at": datetime.now(MSK).strftime("%d.%m.%Y %H:%M:%S"),
+                                       "records": meaningful})
+            _backup["hash"] = h
+            log.info("Резервная копия базы записана в таблицу")
+        except Exception as e:  # noqa: BLE001
+            _backup["changes"] = -1  # повторить при следующей проверке
+            log.warning("Не удалось сохранить резервную копию в таблицу: %s", e)
+
+    th = threading.Thread(target=work, daemon=True)
+    _backup["thread"] = th
+    th.start()
+    if force:
+        th.join(30)
+
+
+# ───────────────────────── «Отчёты в обработке» (меню администратора) ─────────────────────────
+def report_recipients_text(t) -> str:
+    """Кому отправлен отчёт: всем администраторам или конкретному тренеру (с именами)."""
+    reps = latest_reports(t["id"])
+    if not reps:
+        return "отчёт никому не доставлен (получатель не разрешил сообщения от сообщества)"
+    names = ", ".join(user_link(r["user_id"]) for r in reps)
+    if t["kind"] == "free_run":
+        return f"всем администраторам сообщества (подтвердить может любой): {names}"
+    note = next((r["note"] for r in reps if r["note"]), None)
+    if note:
+        why = ("в день самоуправления тренировку провёл не администратор беседы" if "самоуправ" in note
+               else "тренеру доставить не удалось")
+        return f"администраторам сообщества ({why}): {names}"
+    return f"{'тренеру' if len(reps) == 1 else 'тренерам'}: {names}"
+
+
+def pending_messages() -> list:
+    """Тексты сообщений: тренировки/забеги в процессе и отчёты, ожидающие подтверждения."""
+    members = get_members()
+    running, waiting = [], []
+    for t in db.execute("SELECT * FROM trainings WHERE status IN ('active','run','finished') "
+                        "ORDER BY COALESCE(end_ts, start_ts), id").fetchall():
+        peer_txt = (f"Беседа: {chat_title(t['peer_id'])} (№{t['peer_id'] - 2_000_000_000})"
+                    if t["kind"] != "individual" else "Индивидуальная тренировка")
+        total = db.execute("SELECT COUNT(*) FROM participants WHERE training_id=?", (t["id"],)).fetchone()[0]
+        inside = db.execute("SELECT COUNT(*) FROM participants WHERE training_id=? AND leave_ts IS NULL",
+                            (t["id"],)).fetchone()[0]
+        if t["status"] == "active":
+            ensure_trainers(t)
+            who_ = ", ".join(trainer_link(r, trainer_view(r, members)[0]) for r in trainer_rows(t["id"]))
+            running.append("\n".join([
+                f"▶ Тренировка идёт — начало {dt(t['start_ts']):%d.%m.%Y %H:%M}", f"   {peer_txt}",
+                f"   Тренеры: {who_}", f"   Участников отмечено: {total} (сейчас на тренировке: {inside})"]))
+        elif t["status"] == "run":
+            running.append("\n".join([
+                f"🏃 Свободный бег идёт — с {dt(t['start_ts']):%d.%m.%Y %H:%M}", f"   {peer_txt}",
+                f"   Участников: {total} (ещё бегут: {inside})",
+                f"   Отчёт уйдёт всем администраторам сообщества через {fmt_delay(get_free_run_delay())} "
+                "после ухода последнего участника"]))
+        else:
+            d_part, t_part = training_label(t)
+            title = {"free_run": "Свободный бег", "individual": "Индивидуальная тренировка"}.get(t["kind"], "Тренировка")
+            waiting.append("\n".join([
+                f"📝 {title} {d_part}, {t_part} — ждёт подтверждения", f"   {peer_txt}",
+                f"   Участников: {total}", f"   Отчёт отправлен: {report_recipients_text(t)}"]))
+    if not running and not waiting:
+        return ["Незаписанных отчётов и тренировок в процессе нет ✔"]
+    blocks = [f"Отчёты в обработке: {len(running) + len(waiting)}"]
+    n = 0
+    for title, items_ in (("Идут сейчас (отчёта ещё нет):", running), ("Отчёт отправлен, не подтверждён:", waiting)):
+        if items_:
+            blocks.append(title)
+            for it in items_:
+                n += 1
+                blocks.append(f"{n}. {it}")
+    parts, cur = [], ""
+    for b in blocks:  # сообщение VK — до 4096 символов
+        if cur and len(cur) + len(b) + 2 > 3500:
+            parts.append(cur)
+            cur = ""
+        cur += ("\n\n" if cur else "") + b
+    return parts + [cur]
+
+
+def show_pending(uid: int):
+    for part in pending_messages():
+        send_dm(uid, part)
+
+
 # ───────────────────────── запуск ─────────────────────────
 def dispatch_event(event):
     """Разбор одного события Long Poll."""
@@ -2883,12 +3330,15 @@ def main():
             log.warning("REACTION '%s' не настроена — реакция ставиться не будет", k)
 
     check_longpoll_settings()
+    startup_restore()
+    atexit.register(lambda: _backup["enabled"] and backup_tick(force=True))  # последняя копия при остановке
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     while True:
         try:
             lp = VkBotLongPoll(vk_session, GROUP_ID, wait=10)
             log.info("Бот запущен (опрос правок: %s)",
                      f"каждые {EDIT_POLL_SEC} с" if EDIT_POLL_SEC > 0 else "выключен")
-            last_poll = last_tick = 0.0
+            last_poll = last_tick = last_del = 0.0
             while True:
                 for event in lp.check():
                     dispatch_event(event)
@@ -2898,12 +3348,22 @@ def main():
                         free_run_tick()
                     except Exception:
                         log.exception("Ошибка учёта свободного бега")
+                    try:
+                        backup_tick()
+                    except Exception:
+                        log.exception("Ошибка резервного копирования")
                 if EDIT_POLL_SEC > 0 and time.time() - last_poll >= EDIT_POLL_SEC:
                     last_poll = time.time()
                     try:
                         poll_watched_messages()
                     except Exception:
                         log.exception("Ошибка опроса правок")
+                if DELETE_POLL_SEC > 0 and time.time() - last_del >= DELETE_POLL_SEC:
+                    last_del = time.time()
+                    try:
+                        poll_deleted_messages()
+                    except Exception:
+                        log.exception("Ошибка проверки удалённых сообщений")
         except Exception:
             log.exception("Long Poll упал, перезапуск через 5 секунд")
             time.sleep(5)

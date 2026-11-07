@@ -17,6 +17,8 @@
                                                   (с автокоррекцией: без знаков → по двум словам → по первому слову)
 СЛУЖЕБНОЕ
     check_connection() -> dict                  — проверка доступа, создание листов
+    write_backup(blob, meta) / read_backup()    — резервная копия базы бота (лист SHEET_BACKUP, по умолчанию
+                                                  «Резерв бота»): на случай, когда диск хостинга сбрасывается
 
 Командная строка:
     python sheets.py check                      — проверить подключение
@@ -43,6 +45,7 @@
     }
 """
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -617,6 +620,66 @@ def points_summary(date_from: date = None, date_to: date = None):
         for a in acc.values()
     ]
     return sorted(res, key=lambda x: (-x["points"], x["name"]))
+
+
+# ───────────────────────── резервная копия базы бота ─────────────────────────
+BACKUP_HEADER = "bot-backup-v1"
+BACKUP_CHUNK = 40000  # в ячейке Google Таблиц не больше 50 000 символов
+
+
+def _backup_ws(create: bool):
+    sh = _spreadsheet()
+    name = os.getenv("SHEET_BACKUP", "Резерв бота")
+    try:
+        return _retry(sh.worksheet, name)
+    except Exception as e:  # noqa: BLE001
+        if type(e).__name__ != "WorksheetNotFound":
+            raise
+        if not create:
+            return None
+        ws = _retry(sh.add_worksheet, title=name, rows=50, cols=1)
+        try:
+            _retry(ws.hide)  # служебный лист не мешает, но удалять его не нужно
+        except Exception:  # noqa: BLE001
+            pass
+        return ws
+
+
+@_wrap
+def write_backup(blob: str, meta: dict) -> None:
+    """
+    Сохраняет резервную копию (строка base64) в столбец A листа: строка 1 — метка, 2 — служебные данные
+    (время, контрольная сумма), 3 — число фрагментов, дальше фрагменты. Старые лишние строки читатель игнорирует.
+    """
+    ws = _backup_ws(create=True)
+    chunks = [blob[i:i + BACKUP_CHUNK] for i in range(0, len(blob), BACKUP_CHUNK)] or [""]
+    meta = dict(meta, sha256=hashlib.sha256(blob.encode("ascii")).hexdigest())
+    values = [[BACKUP_HEADER], [json.dumps(meta, ensure_ascii=False)], [str(len(chunks))]] + [[c] for c in chunks]
+    if ws.row_count < len(values):
+        _retry(ws.add_rows, len(values) - ws.row_count + 10)
+    _retry(ws.update, range_name="A1", values=values, value_input_option="RAW")
+
+
+@_wrap
+def read_backup():
+    """(строка base64, служебные данные) или None, если копии ещё нет. Проверяет целостность."""
+    ws = _backup_ws(create=False)
+    if ws is None:
+        return None
+    col = _retry(ws.col_values, 1)
+    if len(col) < 3 or col[0] != BACKUP_HEADER:
+        return None
+    try:
+        meta, n = json.loads(col[1]), int(col[2])
+    except (ValueError, TypeError):
+        raise SheetsError("Резервная копия повреждена: не читаются служебные строки")
+    chunks = col[3:3 + n]
+    if len(chunks) != n:
+        raise SheetsError("Резервная копия повреждена: не хватает фрагментов")
+    blob = "".join(chunks)
+    if hashlib.sha256(blob.encode("ascii")).hexdigest() != meta.get("sha256"):
+        raise SheetsError("Резервная копия повреждена: не сошлась контрольная сумма")
+    return blob, meta
 
 
 # ───────────────────────── проверка ─────────────────────────
