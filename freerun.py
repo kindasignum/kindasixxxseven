@@ -8,6 +8,7 @@ None — «время сообщения»), вычет минут (deduct) и �
 """
 import difflib
 import re
+from functools import lru_cache
 import types
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -29,6 +30,7 @@ OUT_W = ["ушел", "ушла", "ушли", "ушол", "уход", "убежа
          "финишировали", "отбегал", "отбегала", "отбегали", "завершил", "завершила", "завершили",
          "отошел", "отошла", "отошли"]
 INTENT_WORDS = sorted(IN_W + OUT_W, key=len, reverse=True)
+_IN_SET, _OUT_SET = frozenset(IN_W), frozenset(OUT_W)
 STOP = set("""и а но я мы ты он она они мне меня нам нас еще уже тоже тут здесь там то это есть нет да ну ладно
 короче ваще вообще просто пожалуйста прошу прощения блять блядь сорри извините спасибо клянусь мамой честно
 забыла забыл забыли время час часа часов минут минуты минуту мин назад через лишним щас сейчас потом
@@ -97,7 +99,7 @@ def _split_glued(T, vocab):
     out = []
     for t in T:
         w = t["v"] if t["k"] == "w" else ""
-        if len(w) >= 7 and w not in vocab and w not in IN_W and w not in OUT_W:
+        if len(w) >= 7 and w not in vocab and w not in _IN_SET and w not in _OUT_SET:
             for iw in INTENT_WORDS:
                 if w.endswith(iw) and len(w) - len(iw) >= 3:
                     out += [dict(t, v=w[:-len(iw)]), {"k": "w", "v": iw}]
@@ -112,21 +114,28 @@ def _split_glued(T, vocab):
     return out
 
 
-def _intent(w: str, vocab: set):
-    if len(w) < 4 or w in vocab:
-        return None
-    if w in IN_W or w.startswith("пашл"):
+@lru_cache(maxsize=20000)
+def _intent_word(w: str):
+    """Действие по слову (результат не зависит от справочника имён, поэтому кэшируется)."""
+    if w in _IN_SET or w.startswith("пашл"):
         return "in"
-    if w in OUT_W or w.startswith(("ушл", "уше")):
+    if w in _OUT_SET or w.startswith(("ушл", "уше")):
         return "out"
     if len(w) >= 5:
         m = difflib.get_close_matches(w, INTENT_WORDS, n=1, cutoff=0.8)
         if m:
-            return "in" if m[0] in IN_W else "out"
+            return "in" if m[0] in _IN_SET else "out"
     return None
 
 
+def _intent(w: str, vocab: set):
+    if len(w) < 4 or w in vocab:
+        return None
+    return _intent_word(w)
+
+
 # ───────────────────────── имена ─────────────────────────
+@lru_cache(maxsize=20000)
 def _dl(a: str, b: str) -> int:
     """Расстояние Дамерау — Левенштейна (учитывает перестановку соседних букв: «плаям» → «пламя»)."""
     la, lb = len(a), len(b)
@@ -143,6 +152,7 @@ def _dl(a: str, b: str) -> int:
     return d[la][lb]
 
 
+@lru_cache(maxsize=50000)
 def _sim(tok: str, key: str) -> float:
     """Похожесть слова на имя: опечатки, перестановки, а также «начало имени» (звезд → звездочет)."""
     best = max(difflib.SequenceMatcher(None, tok, key).ratio(), 1 - _dl(tok, key) / max(len(tok), len(key)))
@@ -150,6 +160,46 @@ def _sim(tok: str, key: str) -> float:
         for L in (len(tok), len(tok) + 1):
             best = max(best, 1 - _dl(tok, key[:L]) / max(len(tok), L) - 0.02)
     return best
+
+
+@lru_cache(maxsize=100000)
+def _hist(s: str):
+    h = {}
+    for ch in s:
+        h[ch] = h.get(ch, 0) + 1
+    return h
+
+
+def _bounds(a: str, b: str):
+    """
+    Дешёвые оценки сверху по составу букв: (предел для SequenceMatcher.ratio, предел для 1 - расстояние/длина).
+    Совпавших букв не больше общего состава, а одна правка меняет состав не более чем на 2 буквы.
+    """
+    ha, hb = _hist(a), _hist(b)
+    inter = 0
+    for ch, c in ha.items():
+        o = hb.get(ch)
+        if o:
+            inter += c if c < o else o
+    la, lb = len(a), len(b)
+    dl_min = -(-(la + lb - 2 * inter) // 2)  # минимум правок (округление вверх)
+    return 2 * inter / (la + lb), dl_min
+
+
+def _may_match(tok: str, key: str, cut: float) -> bool:
+    """
+    Быстрая отсечка перед _sim: оценка сверху (длины и состав букв), результат поиска не меняется —
+    отсекается только то, что заведомо не дотянет до порога cut.
+    """
+    lt, lk = len(tok), len(key)
+    ratio_ub, dl_min = _bounds(tok, key)
+    if ratio_ub >= cut or 1 - dl_min / max(lt, lk) >= cut:
+        return True
+    if lt >= 4 and lk > lt:  # режим «начало имени»: сравнение с началом имени длиной lt и lt+1
+        for L in (lt, lt + 1):
+            if 1 - _bounds(tok, key[:L])[1] / max(lt, L) - 0.02 >= cut:
+                return True
+    return False
 
 
 def _index(mem):
@@ -163,6 +213,8 @@ def _index(mem):
                 nospace.setdefault(k.replace(" ", ""), []).extend(recs)
     idx = types.SimpleNamespace(
         nospace=nospace,
+        vocab={w for k in mem.by_clean for w in k.split()},
+        fz1n={**mem.by_first1, **nospace},
         fz1=dict(mem.by_first1),
         fz2={**mem.by_first2, **{k: v for k, v in mem.by_clean.items() if " " in k}},
         fz3={k: v for k, v in mem.by_clean.items() if k.count(" ") >= 2},
@@ -202,11 +254,13 @@ def _match(cand: str, size: int, mem, hist):
         if size == 1:
             if len(cand) < 5:
                 return None, [], []
-            keys = idx.fz1 if len(cand) < 8 else {**idx.fz1, **idx.nospace}
+            keys = idx.fz1 if len(cand) < 8 else idx.fz1n
             cut = 0.78
         else:
             keys, cut = (idx.fz2 if size == 2 else idx.fz3), 0.85
         for k, rs in keys.items():
+            if not _may_match(cand, k, cut):
+                continue
             sc = _sim(cand, k)
             if sc >= cut:
                 for r in rs:
@@ -246,7 +300,7 @@ def parse(text: str, msg_ts: int, members, author: dict, history: dict = None):
         mentions.append((int(m.group(1)), m.group(2)))
         return " "
     s = MENTION.sub(_men, text).lower().replace("ё", "е")
-    vocab = {w for k in (members.by_clean if members else {}) for w in k.split()}
+    vocab = _index(members).vocab if members else set()
     T = _split_glued(_tokenize(s), vocab)
 
     # вычет минут: «-30 минут», «минус 15 мин», «вычтите мне 15 минут»

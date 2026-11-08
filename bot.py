@@ -64,6 +64,13 @@ EDIT_LIMIT_SEC = 24 * 3600  # VK разрешает редактировать �
 JOIN_TOLERANCE_SEC = 6 * 3600  # насколько раньше старта допускается время прихода при правках
 # как часто (сек) перепроверять непонятные «#…»-сообщения на правки; 0 — отключить опрос
 EDIT_POLL_SEC = int(os.getenv("EDIT_POLL_SEC", "20"))
+# если событие message_edit включено в Long Poll, опрос правок — лишь страховка и идёт реже (сек)
+EDIT_POLL_SLOW_SEC = int(os.getenv("EDIT_POLL_SLOW_SEC", "120"))
+_edit_iv = EDIT_POLL_SEC  # текущий интервал опроса правок (check_longpoll_settings может увеличить)
+# сколько дней хранить в базе подтверждённые/отклонённые тренировки (они уже в таблице); 0 — не чистить
+HISTORY_KEEP_DAYS = int(os.getenv("HISTORY_KEEP_DAYS", "30"))
+# за сколько последних дней закрытые тренировки попадают в резервную копию (незакрытые — всегда)
+BACKUP_KEEP_DAYS = int(os.getenv("BACKUP_KEEP_DAYS", "7"))
 # 1 — писать в лог тип каждого полученного события (для диагностики Long Poll)
 LOG_EVENTS = os.getenv("LOG_EVENTS", "0") == "1"
 # резервная копия базы в Google Таблице (лист «Резерв бота»): 1 — включена; не чаще раза в N секунд
@@ -219,6 +226,23 @@ db.execute(
     "user_id INTEGER PRIMARY KEY, training_id INTEGER NOT NULL, kind TEXT NOT NULL, "
     "num INTEGER, cmid INTEGER, ts INTEGER NOT NULL)"
 )
+for _ix in (  # индексы под реальные запросы бота: поиск по тренировке, по номеру сообщения, по статусу
+    "CREATE INDEX IF NOT EXISTS ix_part_tr ON participants(training_id, num)",
+    "CREATE INDEX IF NOT EXISTS ix_part_join ON participants(join_cmid)",
+    "CREATE INDEX IF NOT EXISTS ix_part_leave ON participants(leave_cmid)",
+    "CREATE INDEX IF NOT EXISTS ix_part_deduct ON participants(deduct_cmid)",
+    "CREATE INDEX IF NOT EXISTS ix_trn_tr ON trainers(training_id, num)",
+    "CREATE INDEX IF NOT EXISTS ix_trn_join ON trainers(join_cmid)",
+    "CREATE INDEX IF NOT EXISTS ix_trn_leave ON trainers(leave_cmid)",
+    "CREATE INDEX IF NOT EXISTS ix_tr_peer ON trainings(peer_id, status)",
+    "CREATE INDEX IF NOT EXISTS ix_tr_status ON trainings(status)",
+    "CREATE INDEX IF NOT EXISTS ix_rep_tr ON reports(training_id, user_id)",
+    "CREATE INDEX IF NOT EXISTS ix_rep_user ON reports(user_id, cmid)",
+    "CREATE INDEX IF NOT EXISTS ix_msg_watch ON msg_log(gone, added_ts)",
+    "CREATE INDEX IF NOT EXISTS ix_frm_peer ON free_run_msgs(peer_id, ts)",
+    "CREATE INDEX IF NOT EXISTS ix_sess_tr ON edit_sessions(training_id)",
+):
+    db.execute(_ix)
 db.commit()
 
 # ───────────────────────── утилиты ─────────────────────────
@@ -1356,42 +1380,6 @@ def handle_chat_edit(msg: dict, source: str = "событие") -> bool:
     return effect
 
 
-def poll_watched_messages():
-    """
-    Запасной способ ловить правки, не зависящий от доставки события message_edit: раз в EDIT_POLL_SEC
-    секунд перечитывает недавние сообщения, где команда не сработала, и, если текст изменился,
-    обрабатывает их как правку.
-    """
-    now = int(time.time())
-    db.execute("DELETE FROM msg_log WHERE added_ts<?", (now - MSG_LOG_KEEP_SEC,))
-    rows = db.execute("SELECT * FROM msg_log WHERE recognized=0 AND added_ts>? ORDER BY peer_id, cmid",
-                      (now - EDIT_WATCH_SEC,)).fetchall()
-    by_peer = {}
-    for r in rows:
-        by_peer.setdefault(r["peer_id"], []).append(r)
-    for peer, items_ in by_peer.items():
-        for i in range(0, len(items_), 100):
-            chunk = items_[i:i + 100]
-            try:
-                resp = vk.messages.getByConversationMessageId(
-                    peer_id=peer, conversation_message_ids=",".join(str(w["cmid"]) for w in chunk))
-            except ApiError as e:
-                log.warning("Опрос правок: не удалось прочитать сообщения беседы %s: %s", peer, e)
-                break
-            found = {it.get("conversation_message_id"): it for it in resp.get("items", [])}
-            for w in chunk:
-                it = found.get(w["cmid"])
-                if not it:
-                    continue  # сообщение удалено
-                new = MENTION_RE.sub("", it.get("text") or "").strip()
-                if new == w["text"]:
-                    continue
-                db.execute("UPDATE msg_log SET text=? WHERE peer_id=? AND cmid=?", (new, peer, w["cmid"]))
-                db.commit()
-                handle_chat_edit(dict(it, peer_id=peer), source="опрос")
-    db.commit()
-
-
 # ───────────────────────── свободный бег ─────────────────────────
 def open_run(peer: int):
     return db.execute("SELECT * FROM trainings WHERE peer_id=? AND kind='free_run' AND status='run' "
@@ -2236,6 +2224,9 @@ def menu_kb(role: str) -> str:
     return kb.get_keyboard()
 
 
+_menu_cache = {}  # uid → версия меню, которая уже показана (чтобы не читать базу на каждое сообщение)
+
+
 def ensure_menu(uid: int, force: bool = False):
     """Показывает пользователю меню по его роли (один раз; снова — если роль изменилась). Ошибки не пробрасывает."""
     if uid <= 0:
@@ -2243,9 +2234,12 @@ def ensure_menu(uid: int, force: bool = False):
     try:
         role = menu_role(uid)
         key = f"admin:{MENU_VERSION}" if role == "admin" else role
+        if not force and _menu_cache.get(uid) == key:
+            return
         row = db.execute("SELECT role FROM menu_state WHERE user_id=?", (uid,)).fetchone()
         old = row["role"] if row else ""
         if key == old and not (force and role):
+            _menu_cache[uid] = key
             return
         if role:
             names = (f"«{MENU_SETTINGS}», «{MENU_PENDING}» и «{MENU_INDIV}»" if role == "admin"
@@ -2259,6 +2253,7 @@ def ensure_menu(uid: int, force: bool = False):
         db.execute("INSERT OR REPLACE INTO menu_state(user_id,role,ts) VALUES(?,?,?)",
                    (uid, key, int(time.time())))
         db.commit()
+        _menu_cache[uid] = key
     except Exception as e:  # noqa: BLE001
         log.warning("Не удалось показать меню %s: %s", uid, e)
 
@@ -2362,8 +2357,14 @@ def send_dm(uid: int, text: str):
         log.warning("Не удалось отправить сообщение %s: %s", uid, e)
 
 
-def refresh_titles():
-    """Обновляет названия известных бесед одним запросом (пакетами по 100)."""
+_titles_ts = [0.0]
+
+
+def refresh_titles(force: bool = False):
+    """Обновляет названия известных бесед одним запросом (пакетами по 100); без force — не чаще раза в 2 минуты."""
+    if not force and time.time() - _titles_ts[0] < 120:
+        return
+    _titles_ts[0] = time.time()
     peers = [r["peer_id"] for r in db.execute("SELECT peer_id FROM chats")]
     for i in range(0, len(peers), 100):
         try:
@@ -2585,6 +2586,8 @@ def show_settings(uid: int, force_new: bool, page: int = 0):
     /настройка → новое сообщение со списком бесед и кнопками. Последующие изменения → редактируем это же
     сообщение; если с его отправки прошло больше 24 часов (или редактирование не удалось) — шлём новое.
     """
+    if force_new:
+        refresh_titles(force=True)  # свежий список по команде /настройка; при кликах по кнопкам — из кэша
     text, kb = main_settings_view(page)
     row = db.execute("SELECT * FROM settings_msgs WHERE user_id=?", (uid,)).fetchone()
     if row and row["cmid"] and not force_new and time.time() - row["sent_ts"] < EDIT_LIMIT_SEC:
@@ -3035,16 +3038,35 @@ def command_deleted(peer: int, cmid):
                    f"сообщение №{cmid}. Таблицу бот не меняет — поправьте запись вручную.")
 
 
-def poll_deleted_messages():
+def poll_interval() -> int:
+    """Как часто вызывать poll_messages (сек); 0 — опросы выключены."""
+    vals = [v for v in (_edit_iv if EDIT_POLL_SEC > 0 else 0, DELETE_POLL_SEC) if v > 0]
+    return min(vals) if vals else 0
+
+
+def poll_messages():
     """
-    VK не присылает боту событие об удалении сообщения, поэтому раз в DELETE_POLL_SEC секунд проверяем недавние
-    сообщения с командами: свежие — каждый раз, старые — раз в 10 минут. Пропавшее сообщение считается удалённым
-    после двух проверок подряд (защита от случайного сбоя VK).
+    Один общий опрос сообщений с командами (вместо двух отдельных), один запрос VK на пачку из 100 сообщений:
+      • правки: нераспознанные сообщения (recognized=0) перечитываются каждые _edit_iv секунд; если текст
+        изменился — обрабатывается как правка (страховка на случай, когда событие message_edit не дошло);
+      • удаления: VK не присылает событие об удалении, поэтому все недавние сообщения с командами проверяются —
+        свежие (до 2 часов) каждые DELETE_POLL_SEC секунд, старые (до DELETE_WATCH_HOURS часов) раз в 10 минут.
+        Пропавшее сообщение считается удалённым после двух проверок подряд (защита от случайного сбоя VK).
     """
     now = int(time.time())
-    rows = db.execute(
-        "SELECT * FROM msg_log WHERE gone=0 AND added_ts>? AND ((added_ts>? AND checked_ts<?) OR checked_ts<?) "
-        "ORDER BY peer_id, cmid", (now - DELETE_WATCH_SEC, now - 7200, now - DELETE_POLL_SEC + 5, now - 600)).fetchall()
+    conds, params, window = [], [], 0
+    if EDIT_POLL_SEC > 0:
+        conds.append("(recognized=0 AND added_ts>? AND checked_ts<?)")
+        params += [now - EDIT_WATCH_SEC, now - _edit_iv + 2]
+        window = EDIT_WATCH_SEC
+    if DELETE_POLL_SEC > 0:
+        conds += ["(added_ts>? AND checked_ts<?)", "(checked_ts<?)"]
+        params += [now - 7200, now - DELETE_POLL_SEC + 2, now - 600]
+        window = max(window, DELETE_WATCH_SEC)
+    if not conds:
+        return
+    rows = db.execute("SELECT * FROM msg_log WHERE gone=0 AND added_ts>? AND (" + " OR ".join(conds) +
+                      ") ORDER BY peer_id, cmid", [now - window] + params).fetchall()
     by_peer = {}
     for r in rows:
         by_peer.setdefault(r["peer_id"], []).append(r)
@@ -3055,15 +3077,24 @@ def poll_deleted_messages():
                 resp = vk.messages.getByConversationMessageId(
                     peer_id=peer, conversation_message_ids=",".join(str(w["cmid"]) for w in chunk))
             except ApiError as e:
-                log.warning("Проверка удалений: не удалось прочитать сообщения беседы %s: %s", peer, e)
+                log.warning("Опрос сообщений: не удалось прочитать беседу %s: %s", peer, e)
                 break
-            found = {it.get("conversation_message_id") for it in resp.get("items", [])}
+            found = {it.get("conversation_message_id"): it for it in resp.get("items", [])}
             need = 3 if not found and len(chunk) >= 3 else 2  # «пропало всё сразу» — скорее сбой, ждём дольше
             for w in chunk:
-                if w["cmid"] in found:
+                it = found.get(w["cmid"])
+                if it is not None:
                     db.execute("UPDATE msg_log SET miss=0, checked_ts=? WHERE peer_id=? AND cmid=?",
                                (now, peer, w["cmid"]))
+                    if EDIT_POLL_SEC > 0 and not w["recognized"]:
+                        new = MENTION_RE.sub("", it.get("text") or "").strip()
+                        if new != w["text"]:
+                            db.execute("UPDATE msg_log SET text=? WHERE peer_id=? AND cmid=?", (new, peer, w["cmid"]))
+                            db.commit()
+                            handle_chat_edit(dict(it, peer_id=peer), source="опрос")
                     continue
+                if DELETE_POLL_SEC <= 0:
+                    continue  # проверка удалений выключена
                 miss = w["miss"] + 1
                 gone = 1 if miss >= need else 0
                 db.execute("UPDATE msg_log SET miss=?, checked_ts=?, gone=? WHERE peer_id=? AND cmid=?",
@@ -3077,6 +3108,35 @@ def poll_deleted_messages():
             db.commit()
 
 
+_maint = {"ts": 0.0}
+
+
+def maintenance_tick(force: bool = False):
+    """
+    Раз в час чистит базу от того, что уже не нужно: журнал команд и историю имён, просроченные окна правок,
+    а также подтверждённые/отклонённые тренировки старше HISTORY_KEEP_DAYS дней (они уже записаны в таблицу;
+    неподтверждённые не удаляются никогда).
+    """
+    now = time.time()
+    if not force and now - _maint["ts"] < 3600:
+        return
+    _maint["ts"] = now
+    n = int(now)
+    db.execute("DELETE FROM msg_log WHERE added_ts<?", (n - MSG_LOG_KEEP_SEC,))
+    db.execute("DELETE FROM free_run_msgs WHERE ts<?", (n - 2 * 86400,))
+    db.execute("DELETE FROM edit_sessions WHERE ts<?", (n - 2 * 86400,))
+    removed = 0
+    if HISTORY_KEEP_DAYS > 0:
+        cond = "status IN ('confirmed','rejected') AND COALESCE(end_ts,start_ts)<?"
+        cutoff = n - HISTORY_KEEP_DAYS * 86400
+        for tbl in ("participants", "trainers", "reports", "edit_sessions"):
+            db.execute(f"DELETE FROM {tbl} WHERE training_id IN (SELECT id FROM trainings WHERE {cond})", (cutoff,))
+        removed = db.execute(f"DELETE FROM trainings WHERE {cond}", (cutoff,)).rowcount
+    db.commit()
+    if removed:
+        log.info("Очистка базы: удалено старых тренировок (уже в таблице): %s", removed)
+
+
 # ───────────────────────── резервная копия базы ─────────────────────────
 # Основная база лежит на постоянном диске (DATA_DIR, см. выше). Параллельно её содержимое раз в BACKUP_INTERVAL_SEC
 # секунд (если что-то изменилось) сохраняется в Google Таблицу — лист «Резерв бота». Если хостинг стёр диск
@@ -3087,10 +3147,31 @@ _backup = {"enabled": False, "hash": None, "changes": -1, "ts": 0.0, "thread": N
 
 
 def build_snapshot():
-    """(строка base64 со сжатым JSON всех таблиц, число значимых записей: беседы + тренировки + настройки)."""
+    """
+    (строка base64 со сжатым JSON, число значимых записей: беседы + тренировки + настройки).
+    В копию входят настройки, всё незакрытое (идут, ждут подтверждения) и закрытое за последние BACKUP_KEEP_DAYS
+    дней — старые подтверждённые тренировки уже в Google Таблице, копия остаётся небольшой и не растёт.
+    """
+    now = int(time.time())
+    keep = (now - BACKUP_KEEP_DAYS * 86400,)
+    tr = "(SELECT id FROM trainings WHERE status IN ('active','run','finished') OR COALESCE(end_ts,start_ts)>=?)"
+    queries = {
+        "chats": ("SELECT * FROM chats ORDER BY rowid", ()),
+        "bot_settings": ("SELECT * FROM bot_settings ORDER BY rowid", ()),
+        "trainings": (f"SELECT * FROM trainings WHERE id IN {tr} ORDER BY rowid", keep),
+        "participants": (f"SELECT * FROM participants WHERE training_id IN {tr} ORDER BY rowid", keep),
+        "trainers": (f"SELECT * FROM trainers WHERE training_id IN {tr} ORDER BY rowid", keep),
+        "reports": (f"SELECT * FROM reports WHERE training_id IN {tr} ORDER BY rowid", keep),
+        "settings_msgs": ("SELECT * FROM settings_msgs ORDER BY rowid", ()),
+        "free_run_msgs": ("SELECT * FROM free_run_msgs WHERE ts>? ORDER BY rowid", (now - 2 * 86400,)),
+        "menu_state": ("SELECT * FROM menu_state ORDER BY rowid", ()),
+        "edit_sessions": (f"SELECT * FROM edit_sessions WHERE training_id IN {tr} OR training_id=0 ORDER BY rowid",
+                          keep),
+    }
     data, meaningful = {"v": 1, "tables": {}}, 0
     for tbl in BACKUP_TABLES:
-        cur = db.execute(f"SELECT * FROM {tbl} ORDER BY rowid")
+        sql, params = queries[tbl]
+        cur = db.execute(sql, params)
         rows = [list(r) for r in cur.fetchall()]
         data["tables"][tbl] = {"cols": [d[0] for d in cur.description], "rows": rows}
         if tbl in ("chats", "bot_settings", "trainings"):
@@ -3119,7 +3200,8 @@ def restore_snapshot(blob: str) -> int:
 
 
 def db_is_fresh() -> bool:
-    return build_snapshot()[1] == 0
+    """База пуста: нет ни бесед, ни тренировок, ни настроек."""
+    return not any(db.execute(f"SELECT 1 FROM {t} LIMIT 1").fetchone() for t in ("chats", "bot_settings", "trainings"))
 
 
 def startup_restore():
@@ -3229,7 +3311,7 @@ def pending_messages() -> list:
         elif t["status"] == "run":
             running.append("\n".join([
                 f"🏃 Свободный бег идёт — с {dt(t['start_ts']):%d.%m.%Y %H:%M}", f"   {peer_txt}",
-                f"   Участников: {total} (ещё бегают: {inside})",
+                f"   Участников: {total} (ещё бегут: {inside})",
                 f"   Отчёт уйдёт всем администраторам сообщества через {fmt_delay(get_free_run_delay())} "
                 "после ухода последнего участника"]))
         else:
@@ -3291,6 +3373,7 @@ def dispatch_event(event):
 
 def check_longpoll_settings():
     """Читает настройки Long Poll сообщества и предупреждает, если не включено нужное."""
+    global _edit_iv
     try:
         st = vk.groups.getLongPollSettings(group_id=GROUP_ID)
     except ApiError as e:
@@ -3306,6 +3389,8 @@ def check_longpoll_settings():
     if not ev.get("message_edit"):
         log.warning("В Long Poll не включено событие «Редактирование сообщения» (message_edit): "
                     "правки #лапа будут ловиться только запасным опросом раз в %s с", EDIT_POLL_SEC)
+    else:
+        _edit_iv = max(EDIT_POLL_SEC, EDIT_POLL_SLOW_SEC)  # события доходят — опрос правок только страховка
     if not ev.get("message_event"):
         log.warning("В Long Poll не включено событие message_event — кнопка «Подтвердить» не заработает")
 
@@ -3331,14 +3416,19 @@ def main():
 
     check_longpoll_settings()
     startup_restore()
+    try:
+        import sheets
+        sheets.warm_members()  # лист «Участники» грузится в фоне — первое сообщение не ждёт Google
+    except Exception:  # noqa: BLE001
+        pass
     atexit.register(lambda: _backup["enabled"] and backup_tick(force=True))  # последняя копия при остановке
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     while True:
         try:
             lp = VkBotLongPoll(vk_session, GROUP_ID, wait=10)
-            log.info("Бот запущен (опрос правок: %s)",
-                     f"каждые {EDIT_POLL_SEC} с" if EDIT_POLL_SEC > 0 else "выключен")
-            last_poll = last_tick = last_del = 0.0
+            log.info("Бот запущен (проверка правок и удалений: %s)",
+                     f"каждые {poll_interval()} с" if poll_interval() > 0 else "выключена")
+            last_poll = last_tick = 0.0
             while True:
                 for event in lp.check():
                     dispatch_event(event)
@@ -3349,21 +3439,20 @@ def main():
                     except Exception:
                         log.exception("Ошибка учёта свободного бега")
                     try:
+                        maintenance_tick()
+                    except Exception:
+                        log.exception("Ошибка очистки базы")
+                    try:
                         backup_tick()
                     except Exception:
                         log.exception("Ошибка резервного копирования")
-                if EDIT_POLL_SEC > 0 and time.time() - last_poll >= EDIT_POLL_SEC:
+                iv = poll_interval()
+                if iv > 0 and time.time() - last_poll >= iv:
                     last_poll = time.time()
                     try:
-                        poll_watched_messages()
+                        poll_messages()
                     except Exception:
-                        log.exception("Ошибка опроса правок")
-                if DELETE_POLL_SEC > 0 and time.time() - last_del >= DELETE_POLL_SEC:
-                    last_del = time.time()
-                    try:
-                        poll_deleted_messages()
-                    except Exception:
-                        log.exception("Ошибка проверки удалённых сообщений")
+                        log.exception("Ошибка опроса сообщений")
         except Exception:
             log.exception("Long Poll упал, перезапуск через 5 секунд")
             time.sleep(5)

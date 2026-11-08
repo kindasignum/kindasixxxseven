@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -126,6 +127,8 @@ def _credentials_info():
 
 
 _sh_cache = {}
+_ws_cache = {}  # (ID таблицы, имя листа) → объект листа: не запрашиваем метаданные таблицы при каждой записи
+_gs_lock = threading.Lock()  # к Google ходят основной поток, фоновое обновление «Участников» и резервная копия
 
 
 def _spreadsheet(sheet_id: str = ""):
@@ -144,8 +147,10 @@ def _spreadsheet(sheet_id: str = ""):
     except ImportError:
         raise SheetsError("Не установлен gspread: pip install -r requirements.txt")
     try:
-        client = gspread.service_account_from_dict(info) if info else gspread.service_account(filename=creds)
-        _sh_cache[sheet_id] = client.open_by_key(sheet_id)
+        with _gs_lock:
+            if sheet_id not in _sh_cache:
+                client = gspread.service_account_from_dict(info) if info else gspread.service_account(filename=creds)
+                _sh_cache[sheet_id] = client.open_by_key(sheet_id)
     except Exception as e:  # noqa: BLE001
         raise SheetsError(
             f"Не удалось открыть таблицу ({type(e).__name__}: {e}). Проверьте ID таблицы, "
@@ -159,7 +164,8 @@ def _retry(fn, *args, **kwargs):
     delay = 2
     for attempt in range(4):
         try:
-            return fn(*args, **kwargs)
+            with _gs_lock:
+                return fn(*args, **kwargs)
         except Exception as e:  # noqa: BLE001
             code = getattr(getattr(e, "response", None), "status_code", None)
             net = type(e).__name__ in ("ConnectionError", "Timeout", "ReadTimeout", "ConnectTimeout")
@@ -185,12 +191,16 @@ def _ensure_ws(name: str, headers):
     нужных столбцов нет — дописывает его заголовок справа (старые данные не трогаются).
     """
     sh = _spreadsheet()
-    try:
-        ws = _retry(sh.worksheet, name)
-    except Exception as e:  # noqa: BLE001
-        if type(e).__name__ != "WorksheetNotFound":
-            raise
-        ws = _retry(sh.add_worksheet, title=name, rows=1000, cols=len(headers))
+    ws = _ws_cache.get((sh.id, name))
+    if ws is None:
+        try:
+            ws = _retry(sh.worksheet, name)
+        except Exception as e:  # noqa: BLE001
+            if type(e).__name__ != "WorksheetNotFound":
+                raise
+            ws = _retry(sh.add_worksheet, title=name, rows=1000, cols=len(headers))
+        _ws_cache[(sh.id, name)] = ws
+    # заголовки читаем каждый раз: порядок столбцов в таблице можно менять, пока бот работает
     head = [str(h).strip() for h in _retry(ws.row_values, 1)]
     if not any(head):
         _retry(ws.update, range_name="A1", values=[list(headers)])
@@ -218,6 +228,7 @@ def _wrap(fn):
         except SheetsError:
             raise
         except Exception as e:  # noqa: BLE001
+            _ws_cache.clear()  # лист могли переименовать/удалить — в следующий раз найдём заново
             raise SheetsError(f"{type(e).__name__}: {e}")
     inner.__name__ = fn.__name__
     inner.__doc__ = fn.__doc__
@@ -370,7 +381,7 @@ class Members:
         return self.match_participant(name, vk_id)[0]
 
 
-_members_cache = {"ts": 0.0, "data": None, "err": None}
+_members_cache = {"ts": 0.0, "data": None, "err": None, "bg": None}
 
 
 @_wrap
@@ -380,12 +391,15 @@ def _load_members_uncached() -> Members:
     col_name = os.getenv("COL_CW_NAME", "Имя на варе")
     ws_name = os.getenv("SHEET_MEMBERS", "Участники")
     sh = _spreadsheet(os.getenv("GOOGLE_MEMBERS_SHEET_ID", ""))
-    try:
-        ws = _retry(sh.worksheet, ws_name)
-    except Exception as e:  # noqa: BLE001
-        if type(e).__name__ == "WorksheetNotFound":
-            raise SheetsError(f"В таблице нет листа «{ws_name}» (SHEET_MEMBERS)")
-        raise
+    ws = _ws_cache.get((sh.id, ws_name))
+    if ws is None:
+        try:
+            ws = _retry(sh.worksheet, ws_name)
+        except Exception as e:  # noqa: BLE001
+            if type(e).__name__ == "WorksheetNotFound":
+                raise SheetsError(f"В таблице нет листа «{ws_name}» (SHEET_MEMBERS)")
+            raise
+        _ws_cache[(sh.id, ws_name)] = ws
     vals = _retry(ws.get_all_values)
     need = [norm_key(col_vk), norm_key(col_cw), norm_key(col_name)]
     hdr_i = idx = None
@@ -406,11 +420,47 @@ def _load_members_uncached() -> Members:
     return Members(recs)
 
 
+def _refresh_members_bg():
+    """Обновляет лист «Участники» в отдельном потоке (один за раз); при сбое остаются прежние данные."""
+    c = _members_cache
+    th = c.get("bg")
+    if th is not None and th.is_alive():
+        return
+
+    def work():
+        try:
+            data = _load_members_uncached()
+            c.update(ts=time.time(), data=data, err=None)
+        except Exception as e:  # noqa: BLE001
+            log.warning("Не удалось обновить лист «Участники» в фоне: %s", e)
+            c["ts"] = time.time()
+            if c["data"] is None:
+                c["err"] = str(e)
+
+    th = threading.Thread(target=work, daemon=True)
+    c["bg"] = th
+    th.start()
+
+
+def warm_members():
+    """Загрузка листа «Участники» в фоне при старте бота, чтобы первое сообщение не ждало Google."""
+    if _members_cache["data"] is None:
+        _refresh_members_bg()
+
+
 def load_members(force: bool = False) -> Members:
     """Лист «Участники» с кэшем на 5 минут. При сбое обновления отдаёт прежние данные, если они есть."""
     c, now = _members_cache, time.time()
     if not force and c["data"] is not None and now - c["ts"] < MEMBERS_TTL:
         return c["data"]
+    if not force and c["data"] is not None:
+        _refresh_members_bg()  # данные устарели: сразу отдаём прежние, новые загружаются в фоне
+        return c["data"]
+    th = c.get("bg")
+    if th is not None and th.is_alive():  # первая загрузка уже идёт в фоне — ждём её, а не грузим второй раз
+        th.join(30)
+        if c["data"] is not None:
+            return c["data"]
     if not force and c["data"] is None and c["err"] and now - c["ts"] < 60:
         raise SheetsError(c["err"])
     try:
