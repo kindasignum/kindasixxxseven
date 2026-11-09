@@ -58,7 +58,9 @@ COOLDOWN_SEC = int(os.getenv("FUN_COOLDOWN_SEC", "45"))
 DAILY_CAP = int(os.getenv("FUN_DAILY_CAP", "40"))
 
 CTX_STORE = 20          # сколько последних сообщений беседы помнить
-CTX_USE = 12            # сколько из них отправлять нейросети
+CTX_HUMANS = max(1, int(os.getenv("FUN_CTX_MESSAGES", "5")))  # сколько последних сообщений участников передавать
+CTX_OWN = 2             # и сколько прошлых реплик бота (чтобы он не повторялся)
+CTX_MAX_AGE_SEC = 30 * 60  # сообщения участников старше 30 минут в контекст не берём
 CTX_TTL_SEC = 6 * 3600  # старше — не используется
 MAX_BOT_STREAK = 3      # столько ответов бота подряд без людей — и бот молчит
 HTTP_TIMEOUT = 25
@@ -381,9 +383,12 @@ def _label(uid: int) -> str:
 
 
 def build_user_message(before: list, target: str) -> str:
-    lines = [f"{_label(x['uid'])}: {x['text']}" for x in before[-CTX_USE:]]
-    ctx = "\n".join(lines) if lines else "(пока тихо)"
-    return (f"Последние сообщения беседы (от старых к новым):\n{ctx}\n\n"
+    now = time.time()
+    humans = [x for x in before if x["uid"] > 0 and now - x["ts"] <= CTX_MAX_AGE_SEC][-CTX_HUMANS:]
+    own = [x for x in before if x["uid"] == -B.GROUP_ID][-CTX_OWN:]
+    picked = sorted(humans + own, key=lambda x: x["ts"])
+    ctx = "\n".join(f"{_label(x['uid'])}: {x['text']}" for x in picked) or "(пока тихо)"
+    return (f"Последние сообщения участников беседы перед этим (от старых к новым):\n{ctx}\n\n"
             f"Сглыпа только что написала: «{target}»\nОтветь на это.")
 
 
