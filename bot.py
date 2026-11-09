@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 import vk_api
 
 import freerun
+import fun
 from vk_api.bot_longpoll import VkBotEventType, VkBotLongPoll
 from vk_api.exceptions import ApiError
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
@@ -1331,6 +1332,7 @@ def log_message(peer: int, uid: int, cmid, date: int, text: str, recognized: boo
 
 
 def handle_chat(msg: dict):
+    fun.on_message(msg)  # развлекательный модуль (fun.py): реакция на сообщения сглыпы; не мешает остальной обработке
     peer, uid, cmid = msg["peer_id"], msg["from_id"], msg.get("conversation_message_id")
     if msg.get("action"):
         return handle_action(peer, msg["action"])
@@ -2392,6 +2394,7 @@ def render_settings() -> str:
                 f"Свободный бег: {'включён' if c['free_run'] else 'отключен'}",
                 f"Тренировки проводят: {'только администраторы' if c['admins_only'] else 'все участники'}",
                 f"День самоуправления: {fmt_days(c['self_gov_days'])}",
+                fun.settings_line(c["peer_id"]),
             ]))
         else:
             blocks.append(f"{cid}. {title} — отключен.")
@@ -2506,6 +2509,7 @@ def chat_settings_view(c, pg: int):
         f"Свободный бег: {'включён' if c['free_run'] else 'отключен'}",
         f"Тренировки проводят: {'только администраторы' if c['admins_only'] else 'все участники'}",
         f"День самоуправления: {fmt_days(c['self_gov_days'])}",
+        fun.settings_line(c["peer_id"]),
     ])
     peer = c["peer_id"]
     kb = VkKeyboard(inline=True)
@@ -2518,6 +2522,8 @@ def chat_settings_view(c, pg: int):
          cmd="cs_tog", f="admins_only", peer=peer, pg=pg)
     kb.add_line()
     _btn(kb, f"ДС: {fmt_days(c['self_gov_days'])}", SEC, cmd="cs_days", peer=peer, pg=pg)
+    kb.add_line()
+    fun.settings_button(kb, peer, pg)
     kb.add_line()
     _btn(kb, "Вернуться", SEC, cmd="cs_back", peer=peer, pg=pg)
     return text, kb.get_keyboard()
@@ -2661,6 +2667,8 @@ def handle_settings_event(obj: dict):
             edit_msg(uid, cmid, *days_view(c, pg, p.get("pc")))
             edit_msg(uid, p.get("pc"), *chat_settings_view(c, pg))
             show_settings(uid, force_new=False, page=pg)
+        elif cmd.startswith("cs_ai"):
+            fun.settings_event(obj, cmd, p, c, pg)
         elif cmd in ("cs_back", "cs_dback"):
             delete_msg(uid, cmid)
         answer_event(obj)
@@ -2698,6 +2706,8 @@ def handle_private(msg: dict):
         return
     ensure_menu(uid)
     if handle_menu(msg):
+        return
+    if fun.handle_private(msg):  # команда /ии (настройка ИИ-ответов)
         return
     if handle_settings(msg):
         return
@@ -3415,6 +3425,7 @@ def main():
             log.warning("REACTION '%s' не настроена — реакция ставиться не будет", k)
 
     check_longpoll_settings()
+    fun.init(sys.modules[__name__])
     startup_restore()
     try:
         import sheets
